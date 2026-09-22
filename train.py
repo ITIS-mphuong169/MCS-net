@@ -69,7 +69,7 @@ def main():
     #                                            num_workers=config.workers, pin_memory=True, drop_last=True)
     # num_classes = train_dataset.num_classes
 
-    dataloaders, dataset_sizes, class_names = get_data_loaders("/media/wjl/wjl/WYP/wangmeng/wikiart",
+    dataloaders, dataset_sizes, class_names = get_data_loaders("/kaggle/input/datasets/steubk/wikiart",
                                                                batch_size=32)
     train_loader = dataloaders['train']
     validate_loader = dataloaders['val']

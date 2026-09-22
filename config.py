@@ -20,7 +20,7 @@ beta = 5e-2  # param for update feature centers
 tag = 'wikiart'
 
 # saving directory of .ckpt models
-save_dir = 'FGVC/wikiart/'
+save_dir = '/kaggle/working/FGVC/wikiart/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 

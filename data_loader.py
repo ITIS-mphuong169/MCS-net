@@ -128,7 +128,8 @@
 
 from PIL import Image
 import os
-from torch.utils.data import DataLoader
+import random
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 # 🛡 在导入数据前设置最大像素限制（防止 DecompressionBombError）
@@ -139,15 +140,16 @@ Image.MAX_IMAGE_PIXELS = 1000000000  # 允许最多 10 亿像素（足够处理�
 import warnings
 warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
 
-def get_data_loaders(data_dir, batch_size=32, num_workers=4):
+def get_data_loaders(data_dir, batch_size=32, num_workers=4, val_split=0.1, test_split=0.1, seed=1231):
     """
-    使用标准 ImageNet 目录格式加载数据集:
+    加载扁平结构的数据集（如 Kaggle 上的 steubk/wikiart）:
         data_dir/
-            train/
-            val/
-            test/
+            <class_1>/
+            <class_2>/
+            ...
 
-    每个子目录下按类别分文件夹存放图像。
+    每个类别一个文件夹，没有现成的 train/val/test 划分，
+    因此按 seed 固定的随机划分自动切出 val_split / test_split，剩余作为 train。
     """
 
     # 💡 增强 transform：确保即使原图极大，在 Resize/Crop 阶段也会被缩小
@@ -185,13 +187,30 @@ def get_data_loaders(data_dir, batch_size=32, num_workers=4):
             # 返回空白图像占位符（避免整个训练中断）
             return Image.new('RGB', (224, 224))
 
-    # 使用 ImageFolder + 自定义 loader 构建数据集
-    image_datasets = {
+    # 用同一份扁平目录，为每种 split 各建一个 ImageFolder（transform 不同）
+    full_datasets = {
         x: datasets.ImageFolder(
-            os.path.join(data_dir, x),
+            data_dir,
             transform=data_transforms[x],
             loader=safe_pil_loader  # ✅ 使用安全加载器
         )
+        for x in ['train', 'val', 'test']
+    }
+
+    # 固定种子，对同一批样本索引做一次划分，三个 split 共用同一份划分结果
+    num_samples = len(full_datasets['train'])
+    indices = list(range(num_samples))
+    random.Random(seed).shuffle(indices)
+    num_val = int(num_samples * val_split)
+    num_test = int(num_samples * test_split)
+    split_indices = {
+        'val': indices[:num_val],
+        'test': indices[num_val:num_val + num_test],
+        'train': indices[num_val + num_test:],
+    }
+
+    image_datasets = {
+        x: Subset(full_datasets[x], split_indices[x])
         for x in ['train', 'val', 'test']
     }
 
@@ -211,6 +230,6 @@ def get_data_loaders(data_dir, batch_size=32, num_workers=4):
 
     # 统计信息
     dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val', 'test']}
-    class_names = image_datasets['train'].classes
+    class_names = full_datasets['train'].classes
 
     return dataloaders, dataset_sizes, class_names
