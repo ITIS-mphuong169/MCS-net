@@ -36,6 +36,7 @@ crop_metric = TopKAccuracyMetric(topk=(1, 5))
 drop_metric = TopKAccuracyMetric(topk=(1, 5))
 
 best_acc = 0.0
+_wandb_batch_log_warned = False
 
 
 # 固定随机种子
@@ -195,7 +196,8 @@ def main():
                 "val/top1": logs['val_topk_accuracy'][0],
                 "val/top5": logs['val_topk_accuracy'][1],
                 "val/best_acc": best_acc,
-            }, step=logs['epoch'])
+                "epoch": logs['epoch'],
+            }, step=(epoch + 1) * len(train_loader))
             print('wandb.log OK for epoch {}'.format(logs['epoch']), flush=True)
         except Exception as e:
             print('wandb.log FAILED for epoch {}: {!r}'.format(logs['epoch'], e), flush=True)
@@ -298,6 +300,22 @@ def train(**kwargs):
 
         pbar.update()
         pbar.set_postfix_str(batch_info)
+
+        # live per-batch logging so loss is visible on W&B without
+        # waiting for a full epoch (~70-90 min) to complete
+        if i % 20 == 0:
+            global_step = epoch * batch_len + i + 1
+            try:
+                wandb.log({
+                    'batch/loss': batch_loss.item(),
+                    'batch/raw_top1': epoch_raw_acc[0],
+                    'epoch': epoch + 1,
+                }, step=global_step)
+            except Exception as e:
+                global _wandb_batch_log_warned
+                if not _wandb_batch_log_warned:
+                    print('wandb.log (per-batch) FAILED: {!r}'.format(e), flush=True)
+                    _wandb_batch_log_warned = True
 
     # end of this epoch
     logs['train_{}'.format(loss_container.name)] = epoch_loss
