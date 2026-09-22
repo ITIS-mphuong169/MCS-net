@@ -103,7 +103,10 @@ def main():
 
     if config.ckpt and os.path.isfile(config.ckpt):
         # Load ckpt and get state_dict
-        checkpoint = torch.load(config.ckpt)
+        # weights_only=False: PyTorch >=2.6 defaults to True, which
+        # rejects the numpy arrays stored in our own 'logs' dict; safe
+        # here since this checkpoint is one we wrote ourselves.
+        checkpoint = torch.load(config.ckpt, weights_only=False)
 
         # Get epoch and some logs
         logs = checkpoint['logs']
