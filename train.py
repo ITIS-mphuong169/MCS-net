@@ -15,6 +15,7 @@ from utils import CenterLoss, AverageMeter, TopKAccuracyMetric, ModelCheckpoint,
 import math
 import numpy as np
 import argparse
+import wandb
 from data_loader import get_data_loaders
 # import thop
 
@@ -60,6 +61,23 @@ def main():
         format='%(asctime)s: %(levelname)s: [%(filename)s:%(lineno)d]: %(message)s',
         level=logging.INFO)
     warnings.filterwarnings("ignore")
+
+    # Fixed run id + resume="allow" so re-running this script in a later
+    # Kaggle session (to continue from a checkpoint) appends to the same
+    # W&B run instead of starting a new one.
+    wandb.init(
+        project="mcs-net-wikiart",
+        id="{}-{}".format(config.tag, config.net),
+        resume="allow",
+        config={
+            "epochs": config.epochs,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "net": config.net,
+            "num_attentions": config.num_attentions,
+            "beta": config.beta,
+        },
+    )
 
     # load dataset
     # train_dataset, validate_dataset = get_trainval_datasets(config.tag, config.image_size)
@@ -160,12 +178,29 @@ def main():
                  pbar=pbar,
                  epoch=epoch)
 
+        wandb.log({
+            "lr": logs['lr'],
+            "train/loss": logs['train_loss'],
+            "train/raw_top1": logs['train_raw_topk_accuracy'][0],
+            "train/raw_top5": logs['train_raw_topk_accuracy'][1],
+            "train/crop_top1": logs['train_crop_topk_accuracy'][0],
+            "train/crop_top5": logs['train_crop_topk_accuracy'][1],
+            "train/drop_top1": logs['train_drop_topk_accuracy'][0],
+            "train/drop_top5": logs['train_drop_topk_accuracy'][1],
+            "val/loss": logs['val_loss'],
+            "val/top1": logs['val_topk_accuracy'][0],
+            "val/top5": logs['val_topk_accuracy'][1],
+            "val/best_acc": best_acc,
+        }, step=logs['epoch'])
+
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(logs['val_loss'])
         else:
             scheduler.step()
         callback.on_epoch_end(logs, net, feature_center=feature_center)
         pbar.close()
+
+    wandb.finish()
 
 
 def adjust_learning(optimizer, epoch, iter):
