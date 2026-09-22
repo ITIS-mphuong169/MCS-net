@@ -181,20 +181,24 @@ def main():
                  pbar=pbar,
                  epoch=epoch)
 
-        wandb.log({
-            "lr": logs['lr'],
-            "train/loss": logs['train_loss'],
-            "train/raw_top1": logs['train_raw_topk_accuracy'][0],
-            "train/raw_top5": logs['train_raw_topk_accuracy'][1],
-            "train/crop_top1": logs['train_crop_topk_accuracy'][0],
-            "train/crop_top5": logs['train_crop_topk_accuracy'][1],
-            "train/drop_top1": logs['train_drop_topk_accuracy'][0],
-            "train/drop_top5": logs['train_drop_topk_accuracy'][1],
-            "val/loss": logs['val_loss'],
-            "val/top1": logs['val_topk_accuracy'][0],
-            "val/top5": logs['val_topk_accuracy'][1],
-            "val/best_acc": best_acc,
-        }, step=logs['epoch'])
+        try:
+            wandb.log({
+                "lr": logs['lr'],
+                "train/loss": logs['train_loss'],
+                "train/raw_top1": logs['train_raw_topk_accuracy'][0],
+                "train/raw_top5": logs['train_raw_topk_accuracy'][1],
+                "train/crop_top1": logs['train_crop_topk_accuracy'][0],
+                "train/crop_top5": logs['train_crop_topk_accuracy'][1],
+                "train/drop_top1": logs['train_drop_topk_accuracy'][0],
+                "train/drop_top5": logs['train_drop_topk_accuracy'][1],
+                "val/loss": logs['val_loss'],
+                "val/top1": logs['val_topk_accuracy'][0],
+                "val/top5": logs['val_topk_accuracy'][1],
+                "val/best_acc": best_acc,
+            }, step=logs['epoch'])
+            print('wandb.log OK for epoch {}'.format(logs['epoch']), flush=True)
+        except Exception as e:
+            print('wandb.log FAILED for epoch {}: {!r}'.format(logs['epoch'], e), flush=True)
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(logs['val_loss'])
