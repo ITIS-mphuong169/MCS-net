@@ -1,5 +1,5 @@
 import os
-import config_distributed as config
+import config
 import time
 import logging
 import warnings
@@ -12,7 +12,6 @@ from torchvision import transforms
 import random
 from models import WSDAN_MCS
 from utils import CenterLoss, AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment
-from datasets import get_trainval_datasets
 import math
 import numpy as np
 import argparse

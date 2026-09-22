@@ -5,12 +5,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import models.resnet as resnet
-from models.inception import inception_v3, BasicConv2d
 
 import random
 
 __all__ = ['WSDAN_MCS']
 EPSILON = 1e-6
+
+
+class BasicConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, **kwargs):
+        super(BasicConv2d, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, bias=False, **kwargs)
+        self.bn = nn.BatchNorm2d(out_channels, eps=0.001)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        return F.relu(x, inplace=True)
 
 
 def weights_init_classifier(m):
@@ -136,6 +147,7 @@ class WSDAN_MCS(nn.Module):
 
         # Network Initialization
         if 'inception' in net:
+            from models.inception import inception_v3
             if net == 'inception_mixed_6e':
                 self.features = inception_v3(pretrained=pretrained).get_features_mixed_6e()
                 self.num_features = 768
