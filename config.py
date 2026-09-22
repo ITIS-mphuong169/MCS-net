@@ -25,6 +25,8 @@ model_name = 'model.ckpt'
 log_name = 'train.log'
 
 # checkpoint model for resume training
-ckpt = False
+# points at the file ModelCheckpoint writes on val-accuracy improvement;
+# train.py only loads it if os.path.isfile(ckpt), so this is a no-op on
+# the very first run and auto-resumes on every run after that
+ckpt = save_dir + model_name
 visual_path = None
-# ckpt = save_dir + model_name
