@@ -159,7 +159,18 @@ def main():
     #              format(config.epochs, config.batch_size, len(train_dataset), len(validate_dataset)))
     # logging.info('')
 
-    for epoch in range(start_epoch, config.epochs):
+    # Kaggle commit runs have a hard wall-clock limit and 100 epochs
+    # won't fit in one. SESSION_EPOCH_LIMIT caps how many epochs this
+    # process runs before exiting cleanly (exit code 0, valid output),
+    # so the next commit can resume from the checkpoint instead of the
+    # whole run getting cut off mid-epoch with output at risk.
+    session_limit = int(os.environ.get('SESSION_EPOCH_LIMIT', config.epochs))
+    end_epoch = min(config.epochs, start_epoch + session_limit)
+    if end_epoch <= start_epoch:
+        print('Nothing to do: start_epoch={} >= end_epoch={}'.format(start_epoch, end_epoch))
+        return
+
+    for epoch in range(start_epoch, end_epoch):
         callback.on_epoch_begin()
         logs['epoch'] = epoch + 1
         logs['lr'] = optimizer.param_groups[0]['lr']
