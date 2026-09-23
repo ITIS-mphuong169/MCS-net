@@ -138,6 +138,25 @@ def batch_augment(images, attention_map, mode='crop', theta=0.5, padding_ratio=0
             'Expected mode in [\'crop\', \'drop\'], but received unsupported augmentation method %s' % mode)
 
 
+class TransformerFeatures(nn.Module):
+    """Wraps a timm features_only backbone (Swin/ConvNeXt/ViT) so it exposes
+    a single forward(x) -> (B, C, H, W) feature map, matching the interface
+    the resnet/inception branches already provide."""
+
+    def __init__(self, backbone, num_features):
+        super(TransformerFeatures, self).__init__()
+        self.backbone = backbone
+        self.num_features = num_features
+
+    def forward(self, x):
+        feat = self.backbone(x)[-1]
+        # some timm backbones (e.g. Swin) return channels-last (B, H, W, C);
+        # normalize to (B, C, H, W) like the conv backbones use
+        if feat.dim() == 4 and feat.shape[1] != self.num_features and feat.shape[-1] == self.num_features:
+            feat = feat.permute(0, 3, 1, 2).contiguous()
+        return feat
+
+
 class WSDAN_MCS(nn.Module):
     def __init__(self, num_classes, M=32, net='inception_mixed_6e', pretrained=False):
         super(WSDAN_MCS, self).__init__()
@@ -163,6 +182,13 @@ class WSDAN_MCS(nn.Module):
             print('==> Using MANet with resnet101 backbone')
             self.features = MANet()
             self.num_features = 2048
+        elif 'swin' in net or 'convnext' in net or 'vit' in net:
+            import timm
+            backbone = timm.create_model(net, pretrained=pretrained, features_only=True)
+            num_features = backbone.feature_info.channels()[-1]
+            self.features = TransformerFeatures(backbone, num_features)
+            self.num_features = num_features
+            print('==> using timm backbone: %s, num_features=%d' % (net, num_features))
         else:
             raise ValueError('Unsupported net: %s' % net)
 
