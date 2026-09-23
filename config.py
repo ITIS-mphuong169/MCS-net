@@ -10,7 +10,7 @@ learning_rate = 1e-3  # initial learning rate
 # Model Config
 ##################################################
 image_size = (224, 224)  # size of training images
-net = 'resnet101'  # inception_mixed_6e
+net = 'swin_tiny_patch4_window7_224'  # experiment: resnet101 in main branch
 num_attentions = 32  # number of attention maps
 beta = 5e-2  # param for update feature centers
 
@@ -20,7 +20,7 @@ beta = 5e-2  # param for update feature centers
 tag = 'wikiart'
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart/'
+save_dir = '/kaggle/working/FGVC/wikiart_swin/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 
