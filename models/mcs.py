@@ -196,12 +196,28 @@ class WSDAN_MCS(nn.Module):
         self.attentions = BasicConv2d(self.num_features, self.M, kernel_size=1)
         # Bilinear Attention Pooling
         self.bap = BAP(pool='GAP')
+        # Part-relationship modeling: BAP's M part-features are otherwise
+        # just concatenated with no interaction between them, so model
+        # relations between parts with self-attention before classifying.
+        self.part_transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=self.num_features, nhead=8,
+                dim_feedforward=self.num_features * 2,
+                batch_first=True,
+            ),
+            num_layers=1,
+        )
         # Classification Layer
         self.fc = nn.Linear(self.M * self.num_features, self.num_classes, bias=False)
 
         logging.info(
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
                                                                                                self.M))
+
+    def _classify(self, feature_matrix, batch_size):
+        parts = feature_matrix.view(batch_size, self.M, self.num_features)
+        parts = self.part_transformer(parts)
+        return self.fc(parts.reshape(batch_size, -1) * 100.)
 
     def visualize(self, x):
         batch_size = x.size(0)
@@ -213,8 +229,8 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
-        feature_matrix = self.bap(feature_maps, attention_maps)
-        p = self.fc(feature_matrix * 100.)
+        feature_matrix, _ = self.bap(feature_maps, attention_maps)
+        p = self._classify(feature_matrix, batch_size)
 
         return p, attention_maps
 
@@ -231,7 +247,7 @@ class WSDAN_MCS(nn.Module):
         feature_matrix, feature_matrix_hat = self.bap(feature_maps, attention_maps)
 
         # Classification
-        p = self.fc(feature_matrix * 100.)
+        p = self._classify(feature_matrix, batch_size)
 
         # Generate Attention Map
         if self.training:
@@ -246,7 +262,7 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_map = torch.mean(attention_maps, dim=1, keepdim=True)  # (B, 1, H, W)
 
-        return p, p - self.fc(feature_matrix_hat * 100.), feature_matrix, attention_map
+        return p, p - self._classify(feature_matrix_hat, batch_size), feature_matrix, attention_map
 
     def load_state_dict(self, state_dict, strict=True):
         model_dict = self.state_dict()

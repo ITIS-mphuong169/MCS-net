@@ -17,10 +17,10 @@ beta = 5e-2  # param for update feature centers
 ##################################################
 # Dataset/Path Config
 ##################################################
-tag = 'wikiart'
+tag = 'wikiart-parttransformer'  # distinct from main's 'wikiart' so the W&B run id doesn't collide
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart/'
+save_dir = '/kaggle/working/FGVC/wikiart_parttransformer/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 
