@@ -199,16 +199,22 @@ class WSDAN_MCS(nn.Module):
         # Part-relationship modeling: BAP's M part-features are otherwise
         # just concatenated with no interaction between them, so model
         # relations between parts with self-attention before classifying.
+        # Project down first (e.g. resnet101's 2048-dim parts) - running the
+        # encoder at full num_features OOM'd a 15GB GPU (d_model=2048,
+        # dim_feedforward=4096, x2 for real+counterfactual, x3 for the
+        # raw/crop/drop forward passes per training step).
+        part_dim = 256
+        self.part_proj = nn.Linear(self.num_features, part_dim)
         self.part_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
-                d_model=self.num_features, nhead=8,
-                dim_feedforward=self.num_features * 2,
+                d_model=part_dim, nhead=8,
+                dim_feedforward=part_dim * 2,
                 batch_first=True,
             ),
             num_layers=1,
         )
         # Classification Layer
-        self.fc = nn.Linear(self.M * self.num_features, self.num_classes, bias=False)
+        self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)
 
         logging.info(
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
@@ -216,6 +222,7 @@ class WSDAN_MCS(nn.Module):
 
     def _classify(self, feature_matrix, batch_size):
         parts = feature_matrix.view(batch_size, self.M, self.num_features)
+        parts = self.part_proj(parts)
         parts = self.part_transformer(parts)
         return self.fc(parts.reshape(batch_size, -1) * 100.)
 
