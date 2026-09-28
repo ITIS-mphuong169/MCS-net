@@ -224,7 +224,11 @@ class WSDAN_MCS(nn.Module):
         parts = feature_matrix.view(batch_size, self.M, self.num_features)
         parts = self.part_proj(parts)
         parts = self.part_transformer(parts)
-        return self.fc(parts.reshape(batch_size, -1) * 100.)
+        # no *100 here: the original code scaled the tiny L2-normalized BAP
+        # output before its single Linear layer, but part_transformer's
+        # LayerNorm already renormalizes to unit scale, so the extra *100
+        # just overshoots and blew up the loss to NaN in practice
+        return self.fc(parts.reshape(batch_size, -1))
 
     def visualize(self, x):
         batch_size = x.size(0)
