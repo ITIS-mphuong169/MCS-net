@@ -47,6 +47,20 @@ def weights_init_kaiming(m):
             nn.init.constant_(m.bias, 0.0)
 
 
+def spatial_shuffle(attentions):
+    """Randomly permutes the H*W spatial positions of each attention map
+    independently (per batch item, per channel) - MCS-Net paper eq. 13's
+    M_bar_i = Normalize(Shuffle(M_i)). A permutation of the same values
+    preserves their sum exactly, satisfying "Normalize" (same overall
+    energy as the original) by construction, so no extra rescaling is
+    needed here."""
+    B, M, H, W = attentions.size()
+    flat = attentions.reshape(B, M, H * W)
+    idx = torch.argsort(torch.rand(B, M, H * W, device=attentions.device), dim=-1)
+    shuffled = torch.gather(flat, -1, idx)
+    return shuffled.view(B, M, H, W)
+
+
 # Bilinear Attention Pooling
 class BAP(nn.Module):
     def __init__(self, pool='GAP'):
@@ -81,10 +95,12 @@ class BAP(nn.Module):
         # l2 normalization along dimension M and C
         feature_matrix = F.normalize(feature_matrix_raw, dim=-1)
 
-        if self.training:
-            fake_att = torch.zeros_like(attentions).uniform_(0, 2)
-        else:
-            fake_att = torch.ones_like(attentions)
+        # MCS-Net paper's CCAM (eq. 13): counterfactual attention is the
+        # real, learned attention with its spatial positions shuffled -
+        # same intensity distribution, no original spatial structure.
+        # (Replaces an earlier from-scratch uniform-random fake_att, which
+        # wasn't actually what the paper describes.)
+        fake_att = spatial_shuffle(attentions)
         counterfactual_feature = (torch.einsum('imjk,injk->imn', fake_att, features) / float(H * W)).view(B, -1)
 
         counterfactual_feature = torch.sign(counterfactual_feature) * torch.sqrt(
