@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import random
 from models import WSDAN_MCS
+from models.mcs import StyleContrastiveLoss
 from utils import CenterLoss, AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment
 import math
 import numpy as np
@@ -26,6 +27,7 @@ torch.backends.cudnn.benchmark = True
 # General loss functions
 cross_entropy_loss = nn.CrossEntropyLoss()
 center_loss = CenterLoss()
+contrastive_loss = StyleContrastiveLoss(temperature=config.tau)
 
 # loss and metric
 loss_container = AverageMeter(name='loss')
@@ -34,6 +36,7 @@ top5_container = AverageMeter(name='top5')
 raw_metric = TopKAccuracyMetric(topk=(1, 5))
 crop_metric = TopKAccuracyMetric(topk=(1, 5))
 drop_metric = TopKAccuracyMetric(topk=(1, 5))
+rel_metric = TopKAccuracyMetric(topk=(1, 5))  # RCAL: accuracy under the real (learned) ISAB relations term
 
 best_acc = 0.0
 _wandb_batch_log_warned = False
@@ -203,6 +206,8 @@ def main():
                 "train/crop_top5": logs['train_crop_topk_accuracy'][1],
                 "train/drop_top1": logs['train_drop_topk_accuracy'][0],
                 "train/drop_top5": logs['train_drop_topk_accuracy'][1],
+                "train/rel_top1": logs['train_rel_topk_accuracy'][0],
+                "train/rel_top5": logs['train_rel_topk_accuracy'][1],
                 "val/loss": logs['val_loss'],
                 "val/top1": logs['val_topk_accuracy'][0],
                 "val/top5": logs['val_topk_accuracy'][1],
@@ -248,6 +253,7 @@ def train(**kwargs):
     raw_metric.reset()
     crop_metric.reset()
     drop_metric.reset()
+    rel_metric.reset()
 
     # begin training
     start_time = time.time()
@@ -266,7 +272,7 @@ def train(**kwargs):
         y = y.to(device)
 
         # raw image
-        y_pred_raw, y_pred_aux, feature_matrix, attention_map = net(X)
+        y_pred_raw, y_pred_aux, y_pred_aux_rel, feature_matrix, attention_map, h = net(X)
 
         # Update Feature Center
         feature_center_batch = F.normalize(feature_center[y], dim=-1)
@@ -282,15 +288,18 @@ def train(**kwargs):
         y_aug = torch.cat([y, y], dim=0)
 
         # crop images forward
-        y_pred_aug, y_pred_aux_aug, _, _ = net(aug_images)
+        y_pred_aug, y_pred_aux_aug, y_pred_aux_rel_aug, _, _, _ = net(aug_images)
 
         y_pred_aux = torch.cat([y_pred_aux, y_pred_aux_aug], dim=0)
+        y_pred_aux_rel = torch.cat([y_pred_aux_rel, y_pred_aux_rel_aug], dim=0)
         y_aux = torch.cat([y, y_aug], dim=0)
 
         # loss
         batch_loss = cross_entropy_loss(y_pred_raw, y) / 3. + \
                      cross_entropy_loss(y_pred_aux, y_aux) * 3. / 3. + \
                      cross_entropy_loss(y_pred_aug, y_aug) * 2. / 3. + \
+                     cross_entropy_loss(y_pred_aux_rel, y_aux) * config.lambda_rel + \
+                     contrastive_loss(h, y) * config.lambda1 + \
                      center_loss(feature_matrix, feature_center_batch)
 
         # backward
@@ -303,11 +312,13 @@ def train(**kwargs):
             epoch_raw_acc = raw_metric(y_pred_raw, y)
             epoch_crop_acc = crop_metric(y_pred_aug, y_aug)
             epoch_drop_acc = drop_metric(y_pred_aux, y_aux)
+            epoch_rel_acc = rel_metric(y_pred_aux_rel, y_aux)
 
         # end of this batch
-        batch_info = 'Loss {:.4f}, Raw Acc ({:.2f}, {:.2f}), Aug Acc ({:.2f}, {:.2f}), Aux Acc ({:.2f}, {:.2f})'.format(
+        batch_info = 'Loss {:.4f}, Raw Acc ({:.2f}, {:.2f}), Aug Acc ({:.2f}, {:.2f}), Aux Acc ({:.2f}, {:.2f}), Rel Acc ({:.2f}, {:.2f})'.format(
             epoch_loss, epoch_raw_acc[0], epoch_raw_acc[1],
-            epoch_crop_acc[0], epoch_crop_acc[1], epoch_drop_acc[0], epoch_drop_acc[1])
+            epoch_crop_acc[0], epoch_crop_acc[1], epoch_drop_acc[0], epoch_drop_acc[1],
+            epoch_rel_acc[0], epoch_rel_acc[1])
 
         pbar.update()
         pbar.set_postfix_str(batch_info)
@@ -320,6 +331,7 @@ def train(**kwargs):
                 wandb.log({
                     'batch/loss': batch_loss.item(),
                     'batch/raw_top1': epoch_raw_acc[0],
+                    'batch/rel_top1': epoch_rel_acc[0],
                     'epoch': epoch + 1,
                 }, step=global_step)
             except Exception as e:
@@ -333,6 +345,7 @@ def train(**kwargs):
     logs['train_raw_{}'.format(raw_metric.name)] = epoch_raw_acc
     logs['train_crop_{}'.format(crop_metric.name)] = epoch_crop_acc
     logs['train_drop_{}'.format(drop_metric.name)] = epoch_drop_acc
+    logs['train_rel_{}'.format(rel_metric.name)] = epoch_rel_acc
     logs['train_info'] = batch_info
     end_time = time.time()
 
@@ -366,10 +379,10 @@ def validate(**kwargs):
             ##################################
             # Raw Image
             ##################################
-            y_pred_raw, y_pred_aux, _, attention_map = net(X)
+            y_pred_raw, y_pred_aux, _, _, attention_map, _ = net(X)
 
             crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop3, y_pred_aux_crop3, _, _ = net(crop_images3)
+            y_pred_crop3, y_pred_aux_crop3, _, _, _, _ = net(crop_images3)
 
             ##################################
             # Final prediction

@@ -47,6 +47,20 @@ def weights_init_kaiming(m):
             nn.init.constant_(m.bias, 0.0)
 
 
+def spatial_shuffle(attentions):
+    """Randomly permutes the H*W spatial positions of each attention map
+    independently (per batch item, per channel) - MCS-Net paper eq. 13's
+    M_bar_i = Normalize(Shuffle(M_i)). A permutation of the same values
+    preserves their sum exactly, satisfying "Normalize" (same overall
+    energy as the original) by construction, so no extra rescaling is
+    needed here."""
+    B, M, H, W = attentions.size()
+    flat = attentions.reshape(B, M, H * W)
+    idx = torch.argsort(torch.rand(B, M, H * W, device=attentions.device), dim=-1)
+    shuffled = torch.gather(flat, -1, idx)
+    return shuffled.view(B, M, H, W)
+
+
 # Bilinear Attention Pooling
 class BAP(nn.Module):
     def __init__(self, pool='GAP'):
@@ -81,10 +95,12 @@ class BAP(nn.Module):
         # l2 normalization along dimension M and C
         feature_matrix = F.normalize(feature_matrix_raw, dim=-1)
 
-        if self.training:
-            fake_att = torch.zeros_like(attentions).uniform_(0, 2)
-        else:
-            fake_att = torch.ones_like(attentions)
+        # MCS-Net paper's CCAM (eq. 13): counterfactual attention is the
+        # real, learned attention with its spatial positions shuffled -
+        # same intensity distribution, no original spatial structure.
+        # (Replaces an earlier from-scratch uniform-random fake_att, which
+        # wasn't actually what the paper describes.)
+        fake_att = spatial_shuffle(attentions)
         counterfactual_feature = (torch.einsum('imjk,injk->imn', fake_att, features) / float(H * W)).view(B, -1)
 
         counterfactual_feature = torch.sign(counterfactual_feature) * torch.sqrt(
@@ -92,6 +108,52 @@ class BAP(nn.Module):
 
         counterfactual_feature = F.normalize(counterfactual_feature, dim=-1)
         return feature_matrix, counterfactual_feature
+
+
+def style_embedding(features, attentions):
+    """MCS-Net paper's SCLM embedding (eq. 8-11): global-pooled backbone
+    feature concatenated with each attention-region's pooled local
+    feature, L2-normalized. Uses the same memory-efficient einsum BAP
+    already uses for region pooling (avoids materializing a (B,L,C,H,W)
+    broadcast tensor, which would be huge for L=32, C up to 2048)."""
+    B, C, H, W = features.size()
+    N = H * W
+    z_global = features.mean(dim=(2, 3))  # (B, C), eq. 10
+    z_local = torch.einsum('imjk,injk->imn', attentions, features) / float(N)  # (B, L, C), eq. 8-9
+    h = torch.cat([z_global, z_local.reshape(B, -1)], dim=1)  # eq. 11
+    return F.normalize(h, dim=-1)
+
+
+class StyleContrastiveLoss(nn.Module):
+    """MCS-Net paper's SCLM contrastive loss (eq. 12), supervised/in-batch
+    (SupCon-style, Khosla et al. 2020): for each anchor, every other
+    sample in the batch with the same label is a positive, everything
+    else is a negative - generalizes eq. 12's single-positive form to
+    however many same-label samples land in a batch."""
+
+    def __init__(self, temperature=0.07):
+        super(StyleContrastiveLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, h, labels):
+        B = h.size(0)
+        sim = torch.matmul(h, h.t()) / self.temperature
+        sim = sim - sim.max(dim=1, keepdim=True)[0].detach()  # numerical stability
+
+        labels = labels.view(-1, 1)
+        same_label = torch.eq(labels, labels.t()).float()
+        self_mask = torch.eye(B, device=h.device)
+        positive_mask = same_label - self_mask
+
+        exp_sim = torch.exp(sim) * (1 - self_mask)
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + EPSILON)
+
+        num_positives = positive_mask.sum(dim=1)
+        valid = num_positives > 0
+        if not valid.any():
+            return h.sum() * 0.  # no positive pairs in this batch; stay differentiable, contribute nothing
+        mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / (num_positives + EPSILON)
+        return -mean_log_prob_pos[valid].mean()
 
 
 def batch_augment(images, attention_map, mode='crop', theta=0.5, padding_ratio=0.1):
@@ -136,6 +198,102 @@ def batch_augment(images, attention_map, mode='crop', theta=0.5, padding_ratio=0
     else:
         raise ValueError(
             'Expected mode in [\'crop\', \'drop\'], but received unsupported augmentation method %s' % mode)
+
+
+class AttentionGenerationModule(nn.Module):
+    """MCS-Net paper's AGM (sec. 2.3, eq. 4-6). Builds a channel
+    correlation matrix P and a spatial correlation matrix Q from the
+    backbone feature F*, then refines F* with both before the existing
+    attention-map generator (eq. 7's G(.), reused as-is) turns the result
+    into the M style-region attention maps.
+
+    P, Q are kept bounded (sigmoid/tanh before the matmul, normalized by
+    the number of terms summed) since this feeds a BatchNorm'd conv right
+    after - unbounded correlation terms here previously caused a loss
+    explosion elsewhere in this codebase (the *100 scaling bug), so this
+    mirrors that lesson defensively.
+    """
+
+    def __init__(self, num_features, lambda_c=0.5, lambda_s=0.5):
+        super(AttentionGenerationModule, self).__init__()
+        self.lambda_c = lambda_c
+        self.lambda_s = lambda_s
+        self.phi = nn.Conv2d(num_features, num_features, kernel_size=1)
+        self.varphi = nn.Conv2d(num_features, num_features, kernel_size=1)
+        self.alpha = nn.Conv2d(num_features, num_features, kernel_size=1)
+        self.beta = nn.Conv2d(num_features, num_features, kernel_size=1)
+
+    def forward(self, F_star):
+        B, C, H, W = F_star.size()
+        N = H * W
+
+        # channel correlation (eq. 4): P, shape (B, C, C)
+        phi_flat = torch.sigmoid(self.phi(F_star)).view(B, C, N)
+        varphi_flat = torch.sigmoid(self.varphi(F_star)).view(B, C, N)
+        P = torch.bmm(phi_flat, varphi_flat.transpose(1, 2)) / N
+
+        # spatial correlation (eq. 5): Q, shape (B, N, N)
+        alpha_flat = torch.tanh(self.alpha(F_star)).view(B, C, N).transpose(1, 2)
+        beta_flat = torch.tanh(self.beta(F_star)).view(B, C, N).transpose(1, 2)
+        Q = torch.bmm(alpha_flat, beta_flat.transpose(1, 2)) / C
+
+        # combine (eq. 6): F_dagger = F* + lambda_c*(F*P) + lambda_s*(Q F*)
+        F_flat = F_star.view(B, C, N).transpose(1, 2)  # (B, N, C)
+        channel_term = torch.bmm(F_flat, P).transpose(1, 2).view(B, C, H, W)
+        spatial_term = torch.bmm(Q, F_flat).transpose(1, 2).view(B, C, H, W)
+        F_dagger = F_star + self.lambda_c * channel_term + self.lambda_s * spatial_term
+        return F_dagger
+
+
+class MAB(nn.Module):
+    """Multihead Attention Block (Lee et al., "Set Transformer", ICML 2019).
+    Cross-attends Q (queries) against K (keys/values): MAB(Q, K)."""
+
+    def __init__(self, dim_Q, dim_K, dim_V, num_heads):
+        super(MAB, self).__init__()
+        self.dim_V = dim_V
+        self.num_heads = num_heads
+        self.fc_q = nn.Linear(dim_Q, dim_V)
+        self.fc_k = nn.Linear(dim_K, dim_V)
+        self.fc_v = nn.Linear(dim_K, dim_V)
+        self.ln0 = nn.LayerNorm(dim_V)
+        self.ln1 = nn.LayerNorm(dim_V)
+        self.fc_o = nn.Linear(dim_V, dim_V)
+
+    def forward(self, Q, K):
+        Q = self.fc_q(Q)
+        K_, V_ = self.fc_k(K), self.fc_v(K)
+
+        dim_split = self.dim_V // self.num_heads
+        Q_ = torch.cat(Q.split(dim_split, 2), 0)
+        K_ = torch.cat(K_.split(dim_split, 2), 0)
+        V_ = torch.cat(V_.split(dim_split, 2), 0)
+
+        A = torch.softmax(Q_.bmm(K_.transpose(1, 2)) / (self.dim_V ** 0.5), 2)
+        O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
+        O = self.ln0(O)
+        O = O + F.relu(self.fc_o(O))
+        O = self.ln1(O)
+        return O
+
+
+class ISAB(nn.Module):
+    """Induced Set Attention Block (Set Transformer, Lee et al. 2019).
+    Routes the input set through a small bank of learnable inducing points
+    (num_inds) instead of attending every element to every other element,
+    which also makes the block permutation-invariant over the input set -
+    unlike plain self-attention, which has no notion of set vs. sequence."""
+
+    def __init__(self, dim_in, dim_out, num_heads, num_inds):
+        super(ISAB, self).__init__()
+        self.inducing_points = nn.Parameter(torch.Tensor(1, num_inds, dim_out))
+        nn.init.xavier_uniform_(self.inducing_points)
+        self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads)
+        self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads)
+
+    def forward(self, X):
+        H = self.mab0(self.inducing_points.repeat(X.size(0), 1, 1), X)
+        return self.mab1(X, H)
 
 
 class TransformerFeatures(nn.Module):
@@ -192,16 +350,56 @@ class WSDAN_MCS(nn.Module):
         else:
             raise ValueError('Unsupported net: %s' % net)
 
-        # Attention Maps
+        # Attention Generation Module (AGM): channel+spatial correlation
+        # refinement of the backbone feature before generating attention
+        # maps from it (MCS-Net paper sec. 2.3).
+        self.agm = AttentionGenerationModule(self.num_features, lambda_c=0.5, lambda_s=0.5)
+        # Attention Maps (eq. 7's G(.), applied to the AGM-refined feature)
         self.attentions = BasicConv2d(self.num_features, self.M, kernel_size=1)
         # Bilinear Attention Pooling
         self.bap = BAP(pool='GAP')
+        # Part-relationship modeling: BAP's M part-features form an
+        # unordered SET (no inherent sequence order), not a sequence - so
+        # use Set Transformer's ISAB (Lee et al. 2019) instead of plain
+        # self-attention, which has no notion of permutation invariance.
+        # ISAB also routes attention through a small bank of inducing
+        # points rather than all M parts attending densely to each other.
+        # Project down first (e.g. resnet101's 2048-dim parts) - running
+        # the block at full num_features OOM'd a 15GB GPU (x2 for
+        # real+counterfactual, x3 for the raw/crop/drop forward passes
+        # per training step).
+        part_dim = 256
+        num_inducing_points = 16
+        self.part_proj = nn.Linear(self.num_features, part_dim)
+        self.part_transformer = ISAB(
+            dim_in=part_dim, dim_out=part_dim,
+            num_heads=8, num_inds=num_inducing_points,
+        )
         # Classification Layer
-        self.fc = nn.Linear(self.M * self.num_features, self.num_classes, bias=False)
+        self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)
 
         logging.info(
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
                                                                                                self.M))
+
+    def _classify(self, feature_matrix, batch_size, randomize_relations=False):
+        parts = feature_matrix.view(batch_size, self.M, self.num_features)
+        parts = self.part_proj(parts)
+        if randomize_relations:
+            # RCAL counterfactual: mix parts with a random (untrained)
+            # weighting instead of ISAB's learned part-relationships, to
+            # isolate whether the LEARNED relationships are causally useful
+            # - same spirit as BAP's fake_att, applied one stage later.
+            random_weights = torch.softmax(
+                torch.rand(batch_size, self.M, self.M, device=parts.device), dim=-1)
+            parts = torch.bmm(random_weights, parts)
+        else:
+            parts = self.part_transformer(parts)
+        # no *100 here: the original code scaled the tiny L2-normalized BAP
+        # output before its single Linear layer, but part_transformer's
+        # LayerNorm already renormalizes to unit scale, so the extra *100
+        # just overshoots and blew up the loss to NaN in practice
+        return self.fc(parts.reshape(batch_size, -1))
 
     def visualize(self, x):
         batch_size = x.size(0)
@@ -209,12 +407,12 @@ class WSDAN_MCS(nn.Module):
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
         if self.net != 'inception_mixed_7c':
-            attention_maps = self.attentions(feature_maps)
+            attention_maps = self.attentions(self.agm(feature_maps))
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
-        feature_matrix = self.bap(feature_maps, attention_maps)
-        p = self.fc(feature_matrix * 100.)
+        feature_matrix, _ = self.bap(feature_maps, attention_maps)
+        p = self._classify(feature_matrix, batch_size)
 
         return p, attention_maps
 
@@ -224,14 +422,23 @@ class WSDAN_MCS(nn.Module):
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
         if self.net != 'inception_mixed_7c':
-            attention_maps = self.attentions(feature_maps)
+            attention_maps = self.attentions(self.agm(feature_maps))
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
         feature_matrix, feature_matrix_hat = self.bap(feature_maps, attention_maps)
 
+        # SCLM style embedding (eq. 8-11), for the contrastive loss
+        # computed externally in train.py (needs batch labels)
+        h = style_embedding(feature_maps, attention_maps)
+
         # Classification
-        p = self.fc(feature_matrix * 100.)
+        p = self._classify(feature_matrix, batch_size)
+        # RCAL: counterfactual on the LEARNED PART-RELATIONSHIPS (ISAB),
+        # using the real (not fake) attention/feature_matrix - isolates the
+        # causal contribution of ISAB's relational modeling, complementing
+        # CAL's existing attention-level counterfactual below.
+        p_cf_relation = self._classify(feature_matrix, batch_size, randomize_relations=True)
 
         # Generate Attention Map
         if self.training:
@@ -246,7 +453,8 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_map = torch.mean(attention_maps, dim=1, keepdim=True)  # (B, 1, H, W)
 
-        return p, p - self.fc(feature_matrix_hat * 100.), feature_matrix, attention_map
+        return (p, p - self._classify(feature_matrix_hat, batch_size), p - p_cf_relation,
+                feature_matrix, attention_map, h)
 
     def load_state_dict(self, state_dict, strict=True):
         model_dict = self.state_dict()
