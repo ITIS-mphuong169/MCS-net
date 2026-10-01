@@ -227,20 +227,29 @@ class AttentionGenerationModule(nn.Module):
         B, C, H, W = F_star.size()
         N = H * W
 
-        # channel correlation (eq. 4): P, shape (B, C, C)
+        # channel correlation (eq. 4) combined with eq. 6's F*P via
+        # matmul associativity: F*@(phi@varphi^T) == (F*@phi)@varphi^T.
+        # The left form never needs the (B,C,C) matrix P materialized -
+        # instead it routes through a (B,N,N) intermediate, which for
+        # resnet101 (C=2048, N=196 at a 14x14 feature map) is ~109x
+        # smaller. Same result, just computed in a cheaper order - this
+        # OOM'd a 15GB GPU when P was built explicitly (confirmed on
+        # Kaggle: tried to allocate exactly B*C*C*4 bytes).
         phi_flat = torch.sigmoid(self.phi(F_star)).view(B, C, N)
         varphi_flat = torch.sigmoid(self.varphi(F_star)).view(B, C, N)
-        P = torch.bmm(phi_flat, varphi_flat.transpose(1, 2)) / N
+        F_flat = F_star.view(B, C, N).transpose(1, 2)  # (B, N, C)
 
-        # spatial correlation (eq. 5): Q, shape (B, N, N)
+        channel_mid = torch.bmm(F_flat, phi_flat)  # (B, N, N) == F* @ phi
+        channel_term = torch.bmm(channel_mid, varphi_flat.transpose(1, 2)) / N  # == F*@P
+        channel_term = channel_term.transpose(1, 2).view(B, C, H, W)
+
+        # spatial correlation (eq. 5): Q, shape (B, N, N) - already small
         alpha_flat = torch.tanh(self.alpha(F_star)).view(B, C, N).transpose(1, 2)
         beta_flat = torch.tanh(self.beta(F_star)).view(B, C, N).transpose(1, 2)
         Q = torch.bmm(alpha_flat, beta_flat.transpose(1, 2)) / C
+        spatial_term = torch.bmm(Q, F_flat).transpose(1, 2).view(B, C, H, W)
 
         # combine (eq. 6): F_dagger = F* + lambda_c*(F*P) + lambda_s*(Q F*)
-        F_flat = F_star.view(B, C, N).transpose(1, 2)  # (B, N, C)
-        channel_term = torch.bmm(F_flat, P).transpose(1, 2).view(B, C, H, W)
-        spatial_term = torch.bmm(Q, F_flat).transpose(1, 2).view(B, C, H, W)
         F_dagger = F_star + self.lambda_c * channel_term + self.lambda_s * spatial_term
         return F_dagger
 
