@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import random
 from models import WSDAN_MCS
+from models.mcs import StyleContrastiveLoss
 from utils import CenterLoss, AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment
 import math
 import numpy as np
@@ -26,6 +27,7 @@ torch.backends.cudnn.benchmark = True
 # General loss functions
 cross_entropy_loss = nn.CrossEntropyLoss()
 center_loss = CenterLoss()
+contrastive_loss = StyleContrastiveLoss(temperature=config.tau)
 
 # loss and metric
 loss_container = AverageMeter(name='loss')
@@ -270,7 +272,7 @@ def train(**kwargs):
         y = y.to(device)
 
         # raw image
-        y_pred_raw, y_pred_aux, y_pred_aux_rel, feature_matrix, attention_map = net(X)
+        y_pred_raw, y_pred_aux, y_pred_aux_rel, feature_matrix, attention_map, h = net(X)
 
         # Update Feature Center
         feature_center_batch = F.normalize(feature_center[y], dim=-1)
@@ -286,7 +288,7 @@ def train(**kwargs):
         y_aug = torch.cat([y, y], dim=0)
 
         # crop images forward
-        y_pred_aug, y_pred_aux_aug, y_pred_aux_rel_aug, _, _ = net(aug_images)
+        y_pred_aug, y_pred_aux_aug, y_pred_aux_rel_aug, _, _, _ = net(aug_images)
 
         y_pred_aux = torch.cat([y_pred_aux, y_pred_aux_aug], dim=0)
         y_pred_aux_rel = torch.cat([y_pred_aux_rel, y_pred_aux_rel_aug], dim=0)
@@ -297,6 +299,7 @@ def train(**kwargs):
                      cross_entropy_loss(y_pred_aux, y_aux) * 3. / 3. + \
                      cross_entropy_loss(y_pred_aug, y_aug) * 2. / 3. + \
                      cross_entropy_loss(y_pred_aux_rel, y_aux) * config.lambda_rel + \
+                     contrastive_loss(h, y) * config.lambda1 + \
                      center_loss(feature_matrix, feature_center_batch)
 
         # backward
@@ -376,10 +379,10 @@ def validate(**kwargs):
             ##################################
             # Raw Image
             ##################################
-            y_pred_raw, y_pred_aux, _, _, attention_map = net(X)
+            y_pred_raw, y_pred_aux, _, _, attention_map, _ = net(X)
 
             crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
+            y_pred_crop3, y_pred_aux_crop3, _, _, _, _ = net(crop_images3)
 
             ##################################
             # Final prediction

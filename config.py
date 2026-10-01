@@ -14,6 +14,8 @@ net = 'resnet101'  # inception_mixed_6e
 num_attentions = 32  # number of attention maps
 beta = 5e-2  # param for update feature centers
 lambda_rel = 0.5  # weight of the RCAL relation-counterfactual loss term
+lambda1 = 0.8  # weight of the SCLM contrastive loss (paper Table 2)
+tau = 0.07  # contrastive loss temperature (paper Table 2)
 
 ##################################################
 # Dataset/Path Config
