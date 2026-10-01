@@ -13,14 +13,15 @@ image_size = (224, 224)  # size of training images
 net = 'resnet101'  # inception_mixed_6e
 num_attentions = 32  # number of attention maps
 beta = 5e-2  # param for update feature centers
+lambda_rel = 0.5  # weight of the RCAL relation-counterfactual loss term
 
 ##################################################
 # Dataset/Path Config
 ##################################################
-tag = 'wikiart-parttransformer'  # distinct from main's 'wikiart' so the W&B run id doesn't collide
+tag = 'wikiart-rcal'  # distinct run id: RCAL changes the loss, keep it a separate experiment from plain ISAB
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart_parttransformer/'
+save_dir = '/kaggle/working/FGVC/wikiart_rcal/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 

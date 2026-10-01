@@ -271,10 +271,19 @@ class WSDAN_MCS(nn.Module):
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
                                                                                                self.M))
 
-    def _classify(self, feature_matrix, batch_size):
+    def _classify(self, feature_matrix, batch_size, randomize_relations=False):
         parts = feature_matrix.view(batch_size, self.M, self.num_features)
         parts = self.part_proj(parts)
-        parts = self.part_transformer(parts)
+        if randomize_relations:
+            # RCAL counterfactual: mix parts with a random (untrained)
+            # weighting instead of ISAB's learned part-relationships, to
+            # isolate whether the LEARNED relationships are causally useful
+            # - same spirit as BAP's fake_att, applied one stage later.
+            random_weights = torch.softmax(
+                torch.rand(batch_size, self.M, self.M, device=parts.device), dim=-1)
+            parts = torch.bmm(random_weights, parts)
+        else:
+            parts = self.part_transformer(parts)
         # no *100 here: the original code scaled the tiny L2-normalized BAP
         # output before its single Linear layer, but part_transformer's
         # LayerNorm already renormalizes to unit scale, so the extra *100
@@ -310,6 +319,11 @@ class WSDAN_MCS(nn.Module):
 
         # Classification
         p = self._classify(feature_matrix, batch_size)
+        # RCAL: counterfactual on the LEARNED PART-RELATIONSHIPS (ISAB),
+        # using the real (not fake) attention/feature_matrix - isolates the
+        # causal contribution of ISAB's relational modeling, complementing
+        # CAL's existing attention-level counterfactual below.
+        p_cf_relation = self._classify(feature_matrix, batch_size, randomize_relations=True)
 
         # Generate Attention Map
         if self.training:
@@ -324,7 +338,8 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_map = torch.mean(attention_maps, dim=1, keepdim=True)  # (B, 1, H, W)
 
-        return p, p - self._classify(feature_matrix_hat, batch_size), feature_matrix, attention_map
+        return (p, p - self._classify(feature_matrix_hat, batch_size), p - p_cf_relation,
+                feature_matrix, attention_map)
 
     def load_state_dict(self, state_dict, strict=True):
         model_dict = self.state_dict()
