@@ -98,7 +98,7 @@ def main():
     # num_classes = train_dataset.num_classes
 
     dataloaders, dataset_sizes, class_names = get_data_loaders("/kaggle/input/datasets/steubk/wikiart",
-                                                               batch_size=32)
+                                                               batch_size=config.batch_size)
     train_loader = dataloaders['train']
     validate_loader = dataloaders['val']
     num_classes = 27
@@ -311,6 +311,13 @@ def train(**kwargs):
         # backward
         batch_loss.backward()
         optimizer.step()
+
+        # Defensive: release cached-but-unused CUDA memory periodically.
+        # AGM+SCLM+ISAB+RCAL combined run right at this GPU's memory
+        # limit (confirmed OOM a few batches in, not just on batch 1),
+        # so guard against slow fragmentation growth over a long run.
+        if i % 50 == 0:
+            torch.cuda.empty_cache()
 
         # metrics: loss and top-1,5 error
         with torch.no_grad():

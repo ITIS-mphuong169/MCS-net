@@ -3,7 +3,10 @@
 ##################################################
 workers = 4  # number of Dataloader workers
 epochs = 100  # number of epochs
-batch_size = 32  # batch size
+batch_size = 16  # batch size (reduced from paper's 32: AGM+SCLM+ISAB+RCAL
+# combined push a 15GB GPU right to its limit at batch 32, with OOM
+# recurring a few batches in even after the AGM memory fix + CUDA
+# allocator tuning - 16 gives real headroom instead of a razor's edge)
 learning_rate = 1e-3  # initial learning rate
 
 ##################################################
