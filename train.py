@@ -18,7 +18,7 @@ from torchvision import transforms
 import random
 from models import WSDAN_MCS
 from models.mcs import StyleContrastiveLoss
-from utils import CenterLoss, AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment
+from utils import AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment
 import math
 import numpy as np
 import argparse
@@ -30,9 +30,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 device = torch.device("cuda")
 torch.backends.cudnn.benchmark = True
 
-# General loss functions
+# General loss functions - matches the paper's eq. 17 (L = Lcls + l1*Lcon +
+# l2*Lcausal); no center_loss, the paper's loss doesn't have one
 cross_entropy_loss = nn.CrossEntropyLoss()
-center_loss = CenterLoss()
 contrastive_loss = StyleContrastiveLoss(temperature=config.tau)
 
 # loss and metric
@@ -108,9 +108,6 @@ def main():
     start_epoch = 0
     net = WSDAN_MCS(num_classes=num_classes, M=config.num_attentions, net=config.net, pretrained=True)
 
-    # feature_center: size of (#classes, #attention_maps * #channel_features)
-    feature_center = torch.zeros(num_classes, config.num_attentions * net.num_features).cuda()
-
     if config.ckpt and os.path.isfile(config.ckpt):
         # Load ckpt and get state_dict
         # weights_only=False: PyTorch >=2.6 defaults to True, which
@@ -127,11 +124,6 @@ def main():
         net.load_state_dict(state_dict)
         logging.info('Network loaded from {}'.format(config.ckpt))
         print('Network loaded from {} @ {} epoch'.format(config.ckpt, start_epoch))
-
-        # load feature center
-        if 'feature_center' in checkpoint:
-            feature_center = checkpoint['feature_center'].cuda()
-            logging.info('feature_center loaded from {}'.format(config.ckpt))
 
     logging.info('Network weights save to {}'.format(config.save_dir))
 
@@ -192,7 +184,6 @@ def main():
               logs=logs,
               data_loader=train_loader,
               net=net,
-              feature_center=feature_center,
               optimizer=optimizer,
               pbar=pbar)
 
@@ -228,7 +219,7 @@ def main():
             scheduler.step(logs['val_loss'])
         else:
             scheduler.step()
-        callback.on_epoch_end(logs, net, feature_center=feature_center)
+        callback.on_epoch_end(logs, net)
         pbar.close()
 
     wandb.finish()
@@ -250,7 +241,6 @@ def train(**kwargs):
     logs = kwargs['logs']
     data_loader = kwargs['data_loader']
     net = kwargs['net']
-    feature_center = kwargs['feature_center']
     optimizer = kwargs['optimizer']
     pbar = kwargs['pbar']
 
@@ -280,10 +270,6 @@ def train(**kwargs):
         # raw image
         y_pred_raw, y_pred_aux, y_pred_aux_rel, feature_matrix, attention_map, h = net(X)
 
-        # Update Feature Center
-        feature_center_batch = F.normalize(feature_center[y], dim=-1)
-        feature_center[y] += config.beta * (feature_matrix.detach() - feature_center_batch)
-
         ##################################
         # Attention Cropping
         ##################################
@@ -300,13 +286,19 @@ def train(**kwargs):
         y_pred_aux_rel = torch.cat([y_pred_aux_rel, y_pred_aux_rel_aug], dim=0)
         y_aux = torch.cat([y, y_aug], dim=0)
 
-        # loss
-        batch_loss = cross_entropy_loss(y_pred_raw, y) / 3. + \
-                     cross_entropy_loss(y_pred_aux, y_aux) * 3. / 3. + \
-                     cross_entropy_loss(y_pred_aug, y_aug) * 2. / 3. + \
-                     cross_entropy_loss(y_pred_aux_rel, y_aux) * config.lambda_rel + \
-                     contrastive_loss(h, y) * config.lambda1 + \
-                     center_loss(feature_matrix, feature_center_batch)
+        # loss - matches the paper's eq. 17 structure (L = Lcls + l1*Lcon +
+        # l2*Lcausal), not the original WS-DAN-style code's loss (which mixed
+        # in a separate aug-image classification term, a 1/3-2/3 split, and
+        # a center loss the paper never uses). That mismatch - lambda1/lambda_rel
+        # tuned for the paper's clean 3-term loss, bolted onto this codebase's
+        # much more crowded original formula - was confirmed on Kaggle to slow
+        # RCAL's convergence well below the other runs at the same epoch.
+        # RCAL's relation-causal term is added on top as its own 4th term.
+        Lcls = cross_entropy_loss(y_pred_raw, y)
+        Lcausal = cross_entropy_loss(y_pred_aux, y_aux)
+        Lcausal_rel = cross_entropy_loss(y_pred_aux_rel, y_aux)
+        Lcon = contrastive_loss(h, y)
+        batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda_rel * Lcausal_rel + config.lambda1 * Lcon
 
         # backward
         batch_loss.backward()

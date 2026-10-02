@@ -15,9 +15,12 @@ learning_rate = 1e-3  # initial learning rate
 image_size = (224, 224)  # size of training images
 net = 'resnet101'  # inception_mixed_6e
 num_attentions = 32  # number of attention maps
-beta = 5e-2  # param for update feature centers
-lambda_rel = 0.5  # weight of the RCAL relation-counterfactual loss term
+# loss weights matching the paper's eq. 17 (L = Lcls + lambda1*Lcon +
+# lambda2*Lcausal), Table 2 values; lambda_rel is RCAL's own addition
+# (no paper equivalent), kept separate from lambda2 for independent tuning
 lambda1 = 0.8  # weight of the SCLM contrastive loss (paper Table 2)
+lambda2 = 0.6  # weight of the CCAM causal loss (paper Table 2)
+lambda_rel = 0.5  # weight of the RCAL relation-counterfactual loss term
 tau = 0.07  # contrastive loss temperature (paper Table 2)
 
 ##################################################
