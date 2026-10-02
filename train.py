@@ -1,4 +1,10 @@
 import os
+# Must be set before torch initializes its CUDA allocator. The AGM module
+# (channel/spatial correlation attention) pushes GPU memory right up to
+# the limit - confirmed OOM on Kaggle with "553.64 MiB reserved by
+# PyTorch but unallocated" (fragmentation) while only ~98MB more was
+# needed, so this directly addresses that per PyTorch's own suggestion.
+os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 import config
 import time
 import logging
