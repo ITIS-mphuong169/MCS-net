@@ -138,6 +138,57 @@ def batch_augment(images, attention_map, mode='crop', theta=0.5, padding_ratio=0
             'Expected mode in [\'crop\', \'drop\'], but received unsupported augmentation method %s' % mode)
 
 
+class MAB(nn.Module):
+    """Multihead Attention Block (Lee et al., "Set Transformer", ICML 2019).
+    Cross-attends Q (queries) against K (keys/values): MAB(Q, K)."""
+
+    def __init__(self, dim_Q, dim_K, dim_V, num_heads):
+        super(MAB, self).__init__()
+        self.dim_V = dim_V
+        self.num_heads = num_heads
+        self.fc_q = nn.Linear(dim_Q, dim_V)
+        self.fc_k = nn.Linear(dim_K, dim_V)
+        self.fc_v = nn.Linear(dim_K, dim_V)
+        self.ln0 = nn.LayerNorm(dim_V)
+        self.ln1 = nn.LayerNorm(dim_V)
+        self.fc_o = nn.Linear(dim_V, dim_V)
+
+    def forward(self, Q, K):
+        Q = self.fc_q(Q)
+        K_, V_ = self.fc_k(K), self.fc_v(K)
+
+        dim_split = self.dim_V // self.num_heads
+        Q_ = torch.cat(Q.split(dim_split, 2), 0)
+        K_ = torch.cat(K_.split(dim_split, 2), 0)
+        V_ = torch.cat(V_.split(dim_split, 2), 0)
+
+        A = torch.softmax(Q_.bmm(K_.transpose(1, 2)) / (self.dim_V ** 0.5), 2)
+        O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
+        O = self.ln0(O)
+        O = O + F.relu(self.fc_o(O))
+        O = self.ln1(O)
+        return O
+
+
+class ISAB(nn.Module):
+    """Induced Set Attention Block (Set Transformer, Lee et al. 2019).
+    Routes the input set through a small bank of learnable inducing points
+    (num_inds) instead of attending every element to every other element,
+    which also makes the block permutation-invariant over the input set -
+    unlike plain self-attention, which has no notion of set vs. sequence."""
+
+    def __init__(self, dim_in, dim_out, num_heads, num_inds):
+        super(ISAB, self).__init__()
+        self.inducing_points = nn.Parameter(torch.Tensor(1, num_inds, dim_out))
+        nn.init.xavier_uniform_(self.inducing_points)
+        self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads)
+        self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads)
+
+    def forward(self, X):
+        H = self.mab0(self.inducing_points.repeat(X.size(0), 1, 1), X)
+        return self.mab1(X, H)
+
+
 class TransformerFeatures(nn.Module):
     """Wraps a timm features_only backbone (Swin/ConvNeXt/ViT) so it exposes
     a single forward(x) -> (B, C, H, W) feature map, matching the interface
@@ -196,22 +247,23 @@ class WSDAN_MCS(nn.Module):
         self.attentions = BasicConv2d(self.num_features, self.M, kernel_size=1)
         # Bilinear Attention Pooling
         self.bap = BAP(pool='GAP')
-        # Part-relationship modeling: BAP's M part-features are otherwise
-        # just concatenated with no interaction between them, so model
-        # relations between parts with self-attention before classifying.
-        # Project down first (e.g. resnet101's 2048-dim parts) - running the
-        # encoder at full num_features OOM'd a 15GB GPU (d_model=2048,
-        # dim_feedforward=4096, x2 for real+counterfactual, x3 for the
-        # raw/crop/drop forward passes per training step).
+        # Part-relationship modeling: BAP's M part-features form an
+        # unordered SET (no inherent sequence order), not a sequence - so
+        # use Set Transformer's ISAB (Lee et al. 2019) instead of plain
+        # self-attention, which has no notion of permutation invariance.
+        # Everything else here is unchanged from the self-attention version
+        # (commit c24644c) this branch forked from, so the two are a fair
+        # apples-to-apples comparison of just the attention mechanism.
+        # Project down first (e.g. resnet101's 2048-dim parts) - running
+        # the block at full num_features OOM'd a 15GB GPU (x2 for
+        # real+counterfactual, x3 for the raw/crop/drop forward passes
+        # per training step).
         part_dim = 256
+        num_inducing_points = 16
         self.part_proj = nn.Linear(self.num_features, part_dim)
-        self.part_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=part_dim, nhead=8,
-                dim_feedforward=part_dim * 2,
-                batch_first=True,
-            ),
-            num_layers=1,
+        self.part_transformer = ISAB(
+            dim_in=part_dim, dim_out=part_dim,
+            num_heads=8, num_inds=num_inducing_points,
         )
         # Classification Layer
         self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)
