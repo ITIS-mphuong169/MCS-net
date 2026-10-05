@@ -68,7 +68,7 @@ def main():
     # W&B run instead of starting a new one.
     wandb.init(
         project="mcs-net-wikiart",
-        id="{}-{}-v2".format(config.tag, config.net),
+        id="{}-{}-v3".format(config.tag, config.net),
         resume="allow",
         config={
             "epochs": config.epochs,
