@@ -3,10 +3,13 @@
 ##################################################
 workers = 4  # number of Dataloader workers
 epochs = 100  # number of epochs
-batch_size = 16  # batch size (reduced from paper's 32: AGM+SCLM+ISAB+RCAL
-# combined push a 15GB GPU right to its limit at batch 32, with OOM
-# recurring a few batches in even after the AGM memory fix + CUDA
-# allocator tuning - 16 gives real headroom instead of a razor's edge)
+batch_size = 32  # batch size (paper Table 2). Was reduced to 16 for the
+# full-paper AGM+SCLM attempt (see exp/part-transformer), which pushed a
+# 15GB GPU to its limit; without AGM, ISAB+RCAL alone matches the
+# memory footprint of the already-stable plain-ISAB run (exp/part-
+# transformer's early plain-ISAB commit), which ran fine at 32 - also
+# lets this run compare directly on the Step axis with the other 3
+# runs (all batch_size=32) without needing the epoch-axis workaround
 learning_rate = 1e-3  # initial learning rate
 
 ##################################################
@@ -15,25 +18,22 @@ learning_rate = 1e-3  # initial learning rate
 image_size = (224, 224)  # size of training images
 net = 'resnet101'  # inception_mixed_6e
 num_attentions = 32  # number of attention maps
-# loss weights matching the paper's eq. 17 (L = Lcls + lambda1*Lcon +
-# lambda2*Lcausal), Table 2 values; lambda_rel is RCAL's own addition
-# (no paper equivalent), kept separate from lambda2 for independent tuning
-lambda1 = 0.8  # weight of the SCLM contrastive loss (paper Table 2)
-lambda2 = 0.6  # weight of the CCAM causal loss (paper Table 2)
+# loss weights: lambda2 matches the paper's CCAM causal term (Table 2);
+# lambda_rel is RCAL's own addition (no paper equivalent). No lambda1/tau
+# here - SCLM (contrastive loss) was dropped along with AGM, see
+# exp/part-transformer for that full-paper attempt
+lambda2 = 0.6  # weight of the CCAM-style causal loss (paper Table 2)
 lambda_rel = 0.5  # weight of the RCAL relation-counterfactual loss term
-tau = 0.07  # contrastive loss temperature (paper Table 2)
 
 ##################################################
 # Dataset/Path Config
 ##################################################
-tag = 'wikiart-rcal-v2'  # new tag: loss reworked to match the paper's eq. 17
-# (dropped center_loss/feature_center, fixed lambda1/lambda2 mismatch) -
-# keep this as a fresh W&B run instead of appending onto the old
-# wikiart-rcal run, whose early history used the broken loss and would
-# otherwise mix misleadingly with the corrected data in the same chart
+tag = 'wikiart-isab-rcal'  # new tag: simplified to ISAB+RCAL only (no
+# AGM/SCLM/CCAM-shuffle - see exp/part-transformer for that attempt),
+# fresh W&B run so it doesn't mix with either earlier attempt's history
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart_rcal_v2/'
+save_dir = '/kaggle/working/FGVC/wikiart_isab_rcal/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 

@@ -146,30 +146,30 @@ def validate(**kwargs):
             ##################################
             # Raw Image
             ##################################
-            y_pred_raw, y_pred_aux_raw, _, _, attention_map, _ = net(X)
-            y_pred_raw_m, y_pred_aux_raw_m, _, _, attention_map_m, _ = net(X_m)
+            y_pred_raw, y_pred_aux_raw, _, _, attention_map = net(X)
+            y_pred_raw_m, y_pred_aux_raw_m, _, _, attention_map_m = net(X_m)
 
             ##################################
             # Object Localization and Refinement
             ##################################
 
             crop_images = batch_augment(X, attention_map, mode='crop', theta=0.3, padding_ratio=0.1)
-            y_pred_crop, y_pred_aux_crop, _, _, _, _ = net(crop_images)
+            y_pred_crop, y_pred_aux_crop, _, _, _ = net(crop_images)
 
             crop_images2 = batch_augment(X, attention_map, mode='crop', theta=0.2, padding_ratio=0.1)
-            y_pred_crop2, y_pred_aux_crop2, _, _, _, _ = net(crop_images2)
+            y_pred_crop2, y_pred_aux_crop2, _, _, _ = net(crop_images2)
 
             crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop3, y_pred_aux_crop3, _, _, _, _ = net(crop_images3)
+            y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
 
             crop_images_m = batch_augment(X_m, attention_map_m, mode='crop', theta=0.3, padding_ratio=0.1)
-            y_pred_crop_m, y_pred_aux_crop_m, _, _, _, _ = net(crop_images_m)
+            y_pred_crop_m, y_pred_aux_crop_m, _, _, _ = net(crop_images_m)
 
             crop_images_m2 = batch_augment(X_m, attention_map_m, mode='crop', theta=0.2, padding_ratio=0.1)
-            y_pred_crop_m2, y_pred_aux_crop_m2, _, _, _, _ = net(crop_images_m2)
+            y_pred_crop_m2, y_pred_aux_crop_m2, _, _, _ = net(crop_images_m2)
 
             crop_images_m3 = batch_augment(X_m, attention_map_m, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop_m3, y_pred_aux_crop_m3, _, _, _, _ = net(crop_images_m3)
+            y_pred_crop_m3, y_pred_aux_crop_m3, _, _, _ = net(crop_images_m3)
 
             y_pred = (y_pred_raw + y_pred_crop + y_pred_crop2 + y_pred_crop3) / 4.
             y_pred_m = (y_pred_raw_m + y_pred_crop_m + y_pred_crop_m2 + y_pred_crop_m3) / 4.

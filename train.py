@@ -17,7 +17,6 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import random
 from models import WSDAN_MCS
-from models.mcs import StyleContrastiveLoss
 from utils import AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment
 import math
 import numpy as np
@@ -30,10 +29,10 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 device = torch.device("cuda")
 torch.backends.cudnn.benchmark = True
 
-# General loss functions - matches the paper's eq. 17 (L = Lcls + l1*Lcon +
-# l2*Lcausal); no center_loss, the paper's loss doesn't have one
+# General loss functions - Lcls + lambda2*Lcausal (CCAM) + lambda_rel*Lcausal_rel
+# (RCAL). No SCLM/Lcon here (dropped along with AGM - see exp/part-transformer
+# for that full-paper attempt) and no center_loss (paper doesn't have one).
 cross_entropy_loss = nn.CrossEntropyLoss()
-contrastive_loss = StyleContrastiveLoss(temperature=config.tau)
 
 # loss and metric
 loss_container = AverageMeter(name='loss')
@@ -85,10 +84,8 @@ def main():
             "learning_rate": config.learning_rate,
             "net": config.net,
             "num_attentions": config.num_attentions,
-            "lambda1": config.lambda1,
             "lambda2": config.lambda2,
             "lambda_rel": config.lambda_rel,
-            "tau": config.tau,
         },
     )
 
@@ -271,7 +268,7 @@ def train(**kwargs):
         y = y.to(device)
 
         # raw image
-        y_pred_raw, y_pred_aux, y_pred_aux_rel, feature_matrix, attention_map, h = net(X)
+        y_pred_raw, y_pred_aux, y_pred_aux_rel, feature_matrix, attention_map = net(X)
 
         ##################################
         # Attention Cropping
@@ -283,25 +280,21 @@ def train(**kwargs):
         y_aug = torch.cat([y, y], dim=0)
 
         # crop images forward
-        y_pred_aug, y_pred_aux_aug, y_pred_aux_rel_aug, _, _, _ = net(aug_images)
+        y_pred_aug, y_pred_aux_aug, y_pred_aux_rel_aug, _, _ = net(aug_images)
 
         y_pred_aux = torch.cat([y_pred_aux, y_pred_aux_aug], dim=0)
         y_pred_aux_rel = torch.cat([y_pred_aux_rel, y_pred_aux_rel_aug], dim=0)
         y_aux = torch.cat([y, y_aug], dim=0)
 
-        # loss - matches the paper's eq. 17 structure (L = Lcls + l1*Lcon +
-        # l2*Lcausal), not the original WS-DAN-style code's loss (which mixed
-        # in a separate aug-image classification term, a 1/3-2/3 split, and
-        # a center loss the paper never uses). That mismatch - lambda1/lambda_rel
-        # tuned for the paper's clean 3-term loss, bolted onto this codebase's
-        # much more crowded original formula - was confirmed on Kaggle to slow
-        # RCAL's convergence well below the other runs at the same epoch.
-        # RCAL's relation-causal term is added on top as its own 4th term.
+        # loss: Lcls (raw-image CE) + lambda2*Lcausal (CAL, combining
+        # raw+aug counterfactual terms) + lambda_rel*Lcausal_rel (RCAL's
+        # relation-level counterfactual, on top as its own term). No
+        # center_loss, no separate aug-image classification term - see
+        # exp/part-transformer for the version with SCLM's Lcon added too.
         Lcls = cross_entropy_loss(y_pred_raw, y)
         Lcausal = cross_entropy_loss(y_pred_aux, y_aux)
         Lcausal_rel = cross_entropy_loss(y_pred_aux_rel, y_aux)
-        Lcon = contrastive_loss(h, y)
-        batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda_rel * Lcausal_rel + config.lambda1 * Lcon
+        batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda_rel * Lcausal_rel
 
         # backward
         batch_loss.backward()
@@ -387,10 +380,10 @@ def validate(**kwargs):
             ##################################
             # Raw Image
             ##################################
-            y_pred_raw, y_pred_aux, _, _, attention_map, _ = net(X)
+            y_pred_raw, y_pred_aux, _, _, attention_map = net(X)
 
             crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop3, y_pred_aux_crop3, _, _, _, _ = net(crop_images3)
+            y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
 
             ##################################
             # Final prediction

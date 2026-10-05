@@ -47,20 +47,6 @@ def weights_init_kaiming(m):
             nn.init.constant_(m.bias, 0.0)
 
 
-def spatial_shuffle(attentions):
-    """Randomly permutes the H*W spatial positions of each attention map
-    independently (per batch item, per channel) - MCS-Net paper eq. 13's
-    M_bar_i = Normalize(Shuffle(M_i)). A permutation of the same values
-    preserves their sum exactly, satisfying "Normalize" (same overall
-    energy as the original) by construction, so no extra rescaling is
-    needed here."""
-    B, M, H, W = attentions.size()
-    flat = attentions.reshape(B, M, H * W)
-    idx = torch.argsort(torch.rand(B, M, H * W, device=attentions.device), dim=-1)
-    shuffled = torch.gather(flat, -1, idx)
-    return shuffled.view(B, M, H, W)
-
-
 # Bilinear Attention Pooling
 class BAP(nn.Module):
     def __init__(self, pool='GAP'):
@@ -95,12 +81,14 @@ class BAP(nn.Module):
         # l2 normalization along dimension M and C
         feature_matrix = F.normalize(feature_matrix_raw, dim=-1)
 
-        # MCS-Net paper's CCAM (eq. 13): counterfactual attention is the
-        # real, learned attention with its spatial positions shuffled -
-        # same intensity distribution, no original spatial structure.
-        # (Replaces an earlier from-scratch uniform-random fake_att, which
-        # wasn't actually what the paper describes.)
-        fake_att = spatial_shuffle(attentions)
+        # Original CAL-style counterfactual: attention sampled fresh from
+        # scratch (not the real one), not the paper's shuffle-based CCAM -
+        # reverted here for stability/simplicity (see exp/part-transformer
+        # for the full-paper AGM+SCLM+CCAM-shuffle attempt).
+        if self.training:
+            fake_att = torch.zeros_like(attentions).uniform_(0, 2)
+        else:
+            fake_att = torch.ones_like(attentions)
         counterfactual_feature = (torch.einsum('imjk,injk->imn', fake_att, features) / float(H * W)).view(B, -1)
 
         counterfactual_feature = torch.sign(counterfactual_feature) * torch.sqrt(
@@ -108,52 +96,6 @@ class BAP(nn.Module):
 
         counterfactual_feature = F.normalize(counterfactual_feature, dim=-1)
         return feature_matrix, counterfactual_feature
-
-
-def style_embedding(features, attentions):
-    """MCS-Net paper's SCLM embedding (eq. 8-11): global-pooled backbone
-    feature concatenated with each attention-region's pooled local
-    feature, L2-normalized. Uses the same memory-efficient einsum BAP
-    already uses for region pooling (avoids materializing a (B,L,C,H,W)
-    broadcast tensor, which would be huge for L=32, C up to 2048)."""
-    B, C, H, W = features.size()
-    N = H * W
-    z_global = features.mean(dim=(2, 3))  # (B, C), eq. 10
-    z_local = torch.einsum('imjk,injk->imn', attentions, features) / float(N)  # (B, L, C), eq. 8-9
-    h = torch.cat([z_global, z_local.reshape(B, -1)], dim=1)  # eq. 11
-    return F.normalize(h, dim=-1)
-
-
-class StyleContrastiveLoss(nn.Module):
-    """MCS-Net paper's SCLM contrastive loss (eq. 12), supervised/in-batch
-    (SupCon-style, Khosla et al. 2020): for each anchor, every other
-    sample in the batch with the same label is a positive, everything
-    else is a negative - generalizes eq. 12's single-positive form to
-    however many same-label samples land in a batch."""
-
-    def __init__(self, temperature=0.07):
-        super(StyleContrastiveLoss, self).__init__()
-        self.temperature = temperature
-
-    def forward(self, h, labels):
-        B = h.size(0)
-        sim = torch.matmul(h, h.t()) / self.temperature
-        sim = sim - sim.max(dim=1, keepdim=True)[0].detach()  # numerical stability
-
-        labels = labels.view(-1, 1)
-        same_label = torch.eq(labels, labels.t()).float()
-        self_mask = torch.eye(B, device=h.device)
-        positive_mask = same_label - self_mask
-
-        exp_sim = torch.exp(sim) * (1 - self_mask)
-        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + EPSILON)
-
-        num_positives = positive_mask.sum(dim=1)
-        valid = num_positives > 0
-        if not valid.any():
-            return h.sum() * 0.  # no positive pairs in this batch; stay differentiable, contribute nothing
-        mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / (num_positives + EPSILON)
-        return -mean_log_prob_pos[valid].mean()
 
 
 def batch_augment(images, attention_map, mode='crop', theta=0.5, padding_ratio=0.1):
@@ -198,60 +140,6 @@ def batch_augment(images, attention_map, mode='crop', theta=0.5, padding_ratio=0
     else:
         raise ValueError(
             'Expected mode in [\'crop\', \'drop\'], but received unsupported augmentation method %s' % mode)
-
-
-class AttentionGenerationModule(nn.Module):
-    """MCS-Net paper's AGM (sec. 2.3, eq. 4-6). Builds a channel
-    correlation matrix P and a spatial correlation matrix Q from the
-    backbone feature F*, then refines F* with both before the existing
-    attention-map generator (eq. 7's G(.), reused as-is) turns the result
-    into the M style-region attention maps.
-
-    P, Q are kept bounded (sigmoid/tanh before the matmul, normalized by
-    the number of terms summed) since this feeds a BatchNorm'd conv right
-    after - unbounded correlation terms here previously caused a loss
-    explosion elsewhere in this codebase (the *100 scaling bug), so this
-    mirrors that lesson defensively.
-    """
-
-    def __init__(self, num_features, lambda_c=0.5, lambda_s=0.5):
-        super(AttentionGenerationModule, self).__init__()
-        self.lambda_c = lambda_c
-        self.lambda_s = lambda_s
-        self.phi = nn.Conv2d(num_features, num_features, kernel_size=1)
-        self.varphi = nn.Conv2d(num_features, num_features, kernel_size=1)
-        self.alpha = nn.Conv2d(num_features, num_features, kernel_size=1)
-        self.beta = nn.Conv2d(num_features, num_features, kernel_size=1)
-
-    def forward(self, F_star):
-        B, C, H, W = F_star.size()
-        N = H * W
-
-        # channel correlation (eq. 4) combined with eq. 6's F*P via
-        # matmul associativity: F*@(phi@varphi^T) == (F*@phi)@varphi^T.
-        # The left form never needs the (B,C,C) matrix P materialized -
-        # instead it routes through a (B,N,N) intermediate, which for
-        # resnet101 (C=2048, N=196 at a 14x14 feature map) is ~109x
-        # smaller. Same result, just computed in a cheaper order - this
-        # OOM'd a 15GB GPU when P was built explicitly (confirmed on
-        # Kaggle: tried to allocate exactly B*C*C*4 bytes).
-        phi_flat = torch.sigmoid(self.phi(F_star)).view(B, C, N)
-        varphi_flat = torch.sigmoid(self.varphi(F_star)).view(B, C, N)
-        F_flat = F_star.view(B, C, N).transpose(1, 2)  # (B, N, C)
-
-        channel_mid = torch.bmm(F_flat, phi_flat)  # (B, N, N) == F* @ phi
-        channel_term = torch.bmm(channel_mid, varphi_flat.transpose(1, 2)) / N  # == F*@P
-        channel_term = channel_term.transpose(1, 2).view(B, C, H, W)
-
-        # spatial correlation (eq. 5): Q, shape (B, N, N) - already small
-        alpha_flat = torch.tanh(self.alpha(F_star)).view(B, C, N).transpose(1, 2)
-        beta_flat = torch.tanh(self.beta(F_star)).view(B, C, N).transpose(1, 2)
-        Q = torch.bmm(alpha_flat, beta_flat.transpose(1, 2)) / C
-        spatial_term = torch.bmm(Q, F_flat).transpose(1, 2).view(B, C, H, W)
-
-        # combine (eq. 6): F_dagger = F* + lambda_c*(F*P) + lambda_s*(Q F*)
-        F_dagger = F_star + self.lambda_c * channel_term + self.lambda_s * spatial_term
-        return F_dagger
 
 
 class MAB(nn.Module):
@@ -359,11 +247,7 @@ class WSDAN_MCS(nn.Module):
         else:
             raise ValueError('Unsupported net: %s' % net)
 
-        # Attention Generation Module (AGM): channel+spatial correlation
-        # refinement of the backbone feature before generating attention
-        # maps from it (MCS-Net paper sec. 2.3).
-        self.agm = AttentionGenerationModule(self.num_features, lambda_c=0.5, lambda_s=0.5)
-        # Attention Maps (eq. 7's G(.), applied to the AGM-refined feature)
+        # Attention Maps
         self.attentions = BasicConv2d(self.num_features, self.M, kernel_size=1)
         # Bilinear Attention Pooling
         self.bap = BAP(pool='GAP')
@@ -416,7 +300,7 @@ class WSDAN_MCS(nn.Module):
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
         if self.net != 'inception_mixed_7c':
-            attention_maps = self.attentions(self.agm(feature_maps))
+            attention_maps = self.attentions(feature_maps)
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
@@ -431,15 +315,11 @@ class WSDAN_MCS(nn.Module):
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
         if self.net != 'inception_mixed_7c':
-            attention_maps = self.attentions(self.agm(feature_maps))
+            attention_maps = self.attentions(feature_maps)
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
         feature_matrix, feature_matrix_hat = self.bap(feature_maps, attention_maps)
-
-        # SCLM style embedding (eq. 8-11), for the contrastive loss
-        # computed externally in train.py (needs batch labels)
-        h = style_embedding(feature_maps, attention_maps)
 
         # Classification
         p = self._classify(feature_matrix, batch_size)
@@ -463,7 +343,7 @@ class WSDAN_MCS(nn.Module):
             attention_map = torch.mean(attention_maps, dim=1, keepdim=True)  # (B, 1, H, W)
 
         return (p, p - self._classify(feature_matrix_hat, batch_size), p - p_cf_relation,
-                feature_matrix, attention_map, h)
+                feature_matrix, attention_map)
 
     def load_state_dict(self, state_dict, strict=True):
         model_dict = self.state_dict()
