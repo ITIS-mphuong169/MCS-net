@@ -26,10 +26,14 @@ tau = 0.07  # contrastive loss temperature (paper Table 2)
 ##################################################
 # Dataset/Path Config
 ##################################################
-tag = 'wikiart-rcal'  # distinct run id: RCAL changes the loss, keep it a separate experiment from plain ISAB
+tag = 'wikiart-rcal-v2'  # new tag: loss reworked to match the paper's eq. 17
+# (dropped center_loss/feature_center, fixed lambda1/lambda2 mismatch) -
+# keep this as a fresh W&B run instead of appending onto the old
+# wikiart-rcal run, whose early history used the broken loss and would
+# otherwise mix misleadingly with the corrected data in the same chart
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart_rcal/'
+save_dir = '/kaggle/working/FGVC/wikiart_rcal_v2/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 
