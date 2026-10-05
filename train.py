@@ -85,7 +85,10 @@ def main():
             "learning_rate": config.learning_rate,
             "net": config.net,
             "num_attentions": config.num_attentions,
-            "beta": config.beta,
+            "lambda1": config.lambda1,
+            "lambda2": config.lambda2,
+            "lambda_rel": config.lambda_rel,
+            "tau": config.tau,
         },
     )
 
