@@ -213,8 +213,17 @@ class WSDAN_MCS(nn.Module):
             ),
             num_layers=1,
         )
-        # Classification Layer
-        self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)
+        # CLS-token readout (BERT/ViT style): a learnable token is prepended
+        # to the 32 parts, attends over them as a Query through the same
+        # self-attention above, and only ITS output feeds the classifier -
+        # instead of flattening all 32 parts' raw outputs. Everything else
+        # (backbone, BAP, part_transformer itself) is unchanged from the
+        # self-attention run (commit c24644c) this branch forked from.
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, part_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        # Classification Layer - only part_dim wide now (reads the CLS
+        # token's output), not M*part_dim (flattened all parts) as before.
+        self.fc = nn.Linear(part_dim, self.num_classes, bias=False)
 
         logging.info(
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
@@ -223,12 +232,15 @@ class WSDAN_MCS(nn.Module):
     def _classify(self, feature_matrix, batch_size):
         parts = feature_matrix.view(batch_size, self.M, self.num_features)
         parts = self.part_proj(parts)
+        cls = self.cls_token.expand(batch_size, -1, -1)
+        parts = torch.cat([cls, parts], dim=1)  # (B, 1+M, part_dim)
         parts = self.part_transformer(parts)
         # no *100 here: the original code scaled the tiny L2-normalized BAP
         # output before its single Linear layer, but part_transformer's
         # LayerNorm already renormalizes to unit scale, so the extra *100
         # just overshoots and blew up the loss to NaN in practice
-        return self.fc(parts.reshape(batch_size, -1))
+        cls_out = parts[:, 0]  # only the CLS token's output feeds the classifier
+        return self.fc(cls_out)
 
     def visualize(self, x):
         batch_size = x.size(0)

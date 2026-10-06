@@ -17,10 +17,13 @@ beta = 5e-2  # param for update feature centers
 ##################################################
 # Dataset/Path Config
 ##################################################
-tag = 'wikiart-parttransformer'  # distinct from main's 'wikiart' so the W&B run id doesn't collide
+tag = 'wikiart-cls-token'  # new tag/dir: CLS-token readout added on top of
+# the self-attention run (commit c24644c) - classifier reads only the CLS
+# token's output instead of flattening all 32 parts. Kept separate so this
+# never resumes into or overwrites the self-attention/isab-fair/gat-fair runs
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart_parttransformer/'
+save_dir = '/kaggle/working/FGVC/wikiart_cls_token/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 
