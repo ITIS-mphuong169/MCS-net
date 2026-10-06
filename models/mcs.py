@@ -138,6 +138,64 @@ def batch_augment(images, attention_map, mode='crop', theta=0.5, padding_ratio=0
             'Expected mode in [\'crop\', \'drop\'], but received unsupported augmentation method %s' % mode)
 
 
+class GATLayer(nn.Module):
+    """Single Graph Attention layer (Velickovic et al., "Graph Attention
+    Networks", ICLR 2018), over a fully-connected graph of the M parts (no
+    explicit edges given - every part attends to every other part, same
+    connectivity as self-attention). The only real difference from
+    self-attention is the attention SCORE: GAT learns an additive score
+    a_src.h_i + a_dst.h_j (then LeakyReLU), instead of self-attention's
+    scaled dot-product Q.K^T."""
+
+    def __init__(self, dim, num_heads):
+        super(GATLayer, self).__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.W = nn.Linear(dim, dim, bias=False)
+        self.a_src = nn.Parameter(torch.Tensor(1, 1, num_heads, self.head_dim))
+        self.a_dst = nn.Parameter(torch.Tensor(1, 1, num_heads, self.head_dim))
+        nn.init.xavier_uniform_(self.W.weight)
+        nn.init.xavier_uniform_(self.a_src)
+        nn.init.xavier_uniform_(self.a_dst)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        B, N, _ = x.shape
+        h = self.W(x).view(B, N, self.num_heads, self.head_dim)
+        src_score = (h * self.a_src).sum(-1)  # (B, N, heads)
+        dst_score = (h * self.a_dst).sum(-1)  # (B, N, heads)
+        e = self.leaky_relu(src_score.unsqueeze(2) + dst_score.unsqueeze(1))  # (B, N, N, heads)
+        alpha = torch.softmax(e, dim=2)
+        out = torch.einsum('bijh,bjhd->bihd', alpha, h)
+        return out.reshape(B, N, self.num_heads * self.head_dim)
+
+
+class GATBlock(nn.Module):
+    """Drop-in replacement for nn.TransformerEncoderLayer with the exact
+    same depth/structure (attention + residual + LayerNorm, then FFN +
+    residual + LayerNorm) - only the attention mechanism inside changes, so
+    this isolates that one factor instead of also changing model depth
+    (unlike the earlier ISAB attempt, which stacked two attention blocks
+    and confounded "different attention" with "deeper model")."""
+
+    def __init__(self, dim, num_heads, dim_feedforward):
+        super(GATBlock, self).__init__()
+        self.gat = GATLayer(dim, num_heads)
+        self.ln0 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim_feedforward),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim_feedforward, dim),
+        )
+        self.ln1 = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        x = self.ln0(x + self.gat(x))
+        x = self.ln1(x + self.ffn(x))
+        return x
+
+
 class TransformerFeatures(nn.Module):
     """Wraps a timm features_only backbone (Swin/ConvNeXt/ViT) so it exposes
     a single forward(x) -> (B, C, H, W) feature map, matching the interface
@@ -198,20 +256,18 @@ class WSDAN_MCS(nn.Module):
         self.bap = BAP(pool='GAP')
         # Part-relationship modeling: BAP's M part-features are otherwise
         # just concatenated with no interaction between them, so model
-        # relations between parts with self-attention before classifying.
+        # relations between parts with GAT (graph attention) before
+        # classifying - same connectivity/depth as the self-attention
+        # version this branch forked from (commit c24644c), only the
+        # attention score formula differs (learned additive vs dot-product).
         # Project down first (e.g. resnet101's 2048-dim parts) - running the
         # encoder at full num_features OOM'd a 15GB GPU (d_model=2048,
         # dim_feedforward=4096, x2 for real+counterfactual, x3 for the
         # raw/crop/drop forward passes per training step).
         part_dim = 256
         self.part_proj = nn.Linear(self.num_features, part_dim)
-        self.part_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=part_dim, nhead=8,
-                dim_feedforward=part_dim * 2,
-                batch_first=True,
-            ),
-            num_layers=1,
+        self.part_transformer = GATBlock(
+            dim=part_dim, num_heads=8, dim_feedforward=part_dim * 2,
         )
         # Classification Layer
         self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)

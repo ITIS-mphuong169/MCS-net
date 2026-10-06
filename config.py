@@ -17,10 +17,13 @@ beta = 5e-2  # param for update feature centers
 ##################################################
 # Dataset/Path Config
 ##################################################
-tag = 'wikiart-parttransformer'  # distinct from main's 'wikiart' so the W&B run id doesn't collide
+tag = 'wikiart-gat-fair'  # new tag/dir: GAT swapped in for self-attention,
+# everything else unchanged from the 'wikiart-parttransformer' self-attention
+# run (commit c24644c) - kept separate so this never resumes into or
+# overwrites that run's or isab-fair's checkpoint/history
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart_parttransformer/'
+save_dir = '/kaggle/working/FGVC/wikiart_gat_fair/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 
