@@ -42,7 +42,6 @@ top5_container = AverageMeter(name='top5')
 raw_metric = TopKAccuracyMetric(topk=(1, 5))
 crop_metric = TopKAccuracyMetric(topk=(1, 5))
 drop_metric = TopKAccuracyMetric(topk=(1, 5))
-rel_metric = TopKAccuracyMetric(topk=(1, 5))  # RCAL: accuracy under the real (learned) ISAB relations term
 
 best_acc = 0.0
 _wandb_batch_log_warned = False
@@ -87,7 +86,6 @@ def main():
             "num_attentions": config.num_attentions,
             "lambda1": config.lambda1,
             "lambda2": config.lambda2,
-            "lambda_rel": config.lambda_rel,
             "tau": config.tau,
         },
     )
@@ -252,7 +250,6 @@ def train(**kwargs):
     raw_metric.reset()
     crop_metric.reset()
     drop_metric.reset()
-    rel_metric.reset()
 
     # begin training
     start_time = time.time()
@@ -271,7 +268,7 @@ def train(**kwargs):
         y = y.to(device)
 
         # raw image
-        y_pred_raw, y_pred_aux, y_pred_aux_rel, feature_matrix, attention_map, h = net(X)
+        y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X)
 
         ##################################
         # Attention Cropping
@@ -283,25 +280,20 @@ def train(**kwargs):
         y_aug = torch.cat([y, y], dim=0)
 
         # crop images forward
-        y_pred_aug, y_pred_aux_aug, y_pred_aux_rel_aug, _, _, _ = net(aug_images)
+        y_pred_aug, y_pred_aux_aug, _, _, _ = net(aug_images)
 
         y_pred_aux = torch.cat([y_pred_aux, y_pred_aux_aug], dim=0)
-        y_pred_aux_rel = torch.cat([y_pred_aux_rel, y_pred_aux_rel_aug], dim=0)
         y_aux = torch.cat([y, y_aug], dim=0)
 
         # loss - matches the paper's eq. 17 structure (L = Lcls + l1*Lcon +
-        # l2*Lcausal), not the original WS-DAN-style code's loss (which mixed
-        # in a separate aug-image classification term, a 1/3-2/3 split, and
-        # a center loss the paper never uses). That mismatch - lambda1/lambda_rel
-        # tuned for the paper's clean 3-term loss, bolted onto this codebase's
-        # much more crowded original formula - was confirmed on Kaggle to slow
-        # RCAL's convergence well below the other runs at the same epoch.
-        # RCAL's relation-causal term is added on top as its own 4th term.
+        # l2*Lcausal). RCAL (the relation-counterfactual extension
+        # previously added as a 4th term here) is dropped - confirmed on
+        # Kaggle to hurt accuracy regardless of which other modules were
+        # present, in a dedicated A/B comparison.
         Lcls = cross_entropy_loss(y_pred_raw, y)
         Lcausal = cross_entropy_loss(y_pred_aux, y_aux)
-        Lcausal_rel = cross_entropy_loss(y_pred_aux_rel, y_aux)
         Lcon = contrastive_loss(h, y)
-        batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda_rel * Lcausal_rel + config.lambda1 * Lcon
+        batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda1 * Lcon
 
         # backward
         batch_loss.backward()
@@ -320,13 +312,11 @@ def train(**kwargs):
             epoch_raw_acc = raw_metric(y_pred_raw, y)
             epoch_crop_acc = crop_metric(y_pred_aug, y_aug)
             epoch_drop_acc = drop_metric(y_pred_aux, y_aux)
-            epoch_rel_acc = rel_metric(y_pred_aux_rel, y_aux)
 
         # end of this batch
-        batch_info = 'Loss {:.4f}, Raw Acc ({:.2f}, {:.2f}), Aug Acc ({:.2f}, {:.2f}), Aux Acc ({:.2f}, {:.2f}), Rel Acc ({:.2f}, {:.2f})'.format(
+        batch_info = 'Loss {:.4f}, Raw Acc ({:.2f}, {:.2f}), Aug Acc ({:.2f}, {:.2f}), Aux Acc ({:.2f}, {:.2f})'.format(
             epoch_loss, epoch_raw_acc[0], epoch_raw_acc[1],
-            epoch_crop_acc[0], epoch_crop_acc[1], epoch_drop_acc[0], epoch_drop_acc[1],
-            epoch_rel_acc[0], epoch_rel_acc[1])
+            epoch_crop_acc[0], epoch_crop_acc[1], epoch_drop_acc[0], epoch_drop_acc[1])
 
         pbar.update()
         pbar.set_postfix_str(batch_info)
@@ -339,7 +329,6 @@ def train(**kwargs):
                 wandb.log({
                     'batch/loss': batch_loss.item(),
                     'batch/raw_top1': epoch_raw_acc[0],
-                    'batch/rel_top1': epoch_rel_acc[0],
                     'epoch': epoch + 1,
                 }, step=global_step)
             except Exception as e:
@@ -353,7 +342,6 @@ def train(**kwargs):
     logs['train_raw_{}'.format(raw_metric.name)] = epoch_raw_acc
     logs['train_crop_{}'.format(crop_metric.name)] = epoch_crop_acc
     logs['train_drop_{}'.format(drop_metric.name)] = epoch_drop_acc
-    logs['train_rel_{}'.format(rel_metric.name)] = epoch_rel_acc
     logs['train_info'] = batch_info
     end_time = time.time()
 
@@ -387,10 +375,10 @@ def validate(**kwargs):
             ##################################
             # Raw Image
             ##################################
-            y_pred_raw, y_pred_aux, _, _, attention_map, _ = net(X)
+            y_pred_raw, y_pred_aux, _, attention_map, _ = net(X)
 
             crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop3, y_pred_aux_crop3, _, _, _, _ = net(crop_images3)
+            y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
 
             ##################################
             # Final prediction
