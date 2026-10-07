@@ -5,9 +5,9 @@ workers = 4  # number of Dataloader workers
 epochs = 100  # number of epochs
 batch_size = 16  # batch size (reduced from paper's 32: AGM+SCLM combined
 # push a 15GB GPU right to its limit at batch 32, with OOM recurring a few
-# batches in even after the AGM memory fix + CUDA allocator tuning - kept
-# at 16 for headroom even though self-attention replacing ISAB+RCAL here
-# frees up some memory, since GPU quota is too scarce to risk re-testing)
+# batches in even after the AGM memory fix + CUDA allocator tuning. Kept
+# at 16 to match exp/full-paper-self-attention's batch_size exactly, so
+# the two runs are comparable apples-to-apples)
 learning_rate = 1e-3  # initial learning rate
 
 ##################################################
@@ -25,15 +25,14 @@ tau = 0.07  # contrastive loss temperature (paper Table 2)
 ##################################################
 # Dataset/Path Config
 ##################################################
-tag = 'wikiart-fullpaper-selfattn'  # new tag: full paper modules (AGM+SCLM+
-# CCAM) combined with self-attention for part-relationship modeling - the
-# attention mechanism confirmed best in a separate fair comparison against
-# ISAB and GAT. RCAL (tried here previously) is dropped - confirmed to hurt
-# accuracy regardless of which other modules were present. Fresh tag/dir so
-# this never resumes into or overwrites the rcal-v2 run's checkpoint/history
+tag = 'wikiart-fullpaper-baseline'  # new tag: the paper's own baseline -
+# AGM+SCLM+CCAM, no part-relationship module added (32 parts just
+# concatenated, as the paper itself does) - reference point to measure
+# whether exp/full-paper-self-attention's added module is worth it.
+# Fresh tag/dir so this never resumes into or overwrites any other run
 
 # saving directory of .ckpt models
-save_dir = '/kaggle/working/FGVC/wikiart_fullpaper_selfattn/'
+save_dir = '/kaggle/working/FGVC/wikiart_fullpaper_baseline/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 

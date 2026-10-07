@@ -317,44 +317,25 @@ class WSDAN_MCS(nn.Module):
         # Bilinear Attention Pooling
         self.bap = BAP(pool='GAP')
         # Part-relationship modeling: BAP's M part-features are otherwise
-        # just concatenated with no interaction between them, so model
-        # relations between parts with self-attention before classifying -
-        # confirmed the best-performing attention mechanism for this (beat
-        # ISAB and GAT in a separate fair, isolated comparison) before being
-        # combined here with the paper's AGM/SCLM/CCAM modules. RCAL (the
-        # relation-counterfactual extension previously tried here) is
-        # dropped - confirmed to hurt accuracy regardless of which other
-        # modules were present.
-        # Project down first (e.g. resnet101's 2048-dim parts) - running the
-        # encoder at full num_features OOM'd a 15GB GPU (d_model=2048,
-        # dim_feedforward=4096, x2 for real+counterfactual, x3 for the
-        # raw/crop/drop forward passes per training step).
-        part_dim = 256
-        self.part_proj = nn.Linear(self.num_features, part_dim)
-        self.part_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=part_dim, nhead=8,
-                dim_feedforward=part_dim * 2,
-                batch_first=True,
-            ),
-            num_layers=1,
-        )
+        # just concatenated with no interaction between them (the paper
+        # itself has no module for this - AGM refines the feature map
+        # before the 32 regions are found, SCLM/CCAM don't relate the
+        # regions to each other either). This branch is the paper's own
+        # baseline - no part-relationship module added - kept as a
+        # reference point to measure whether adding one (see
+        # exp/full-paper-self-attention) is actually worth it.
         # Classification Layer
-        self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)
+        self.fc = nn.Linear(self.M * self.num_features, self.num_classes, bias=False)
 
         logging.info(
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
                                                                                                self.M))
 
     def _classify(self, feature_matrix, batch_size):
-        parts = feature_matrix.view(batch_size, self.M, self.num_features)
-        parts = self.part_proj(parts)
-        parts = self.part_transformer(parts)
-        # no *100 here: the original code scaled the tiny L2-normalized BAP
-        # output before its single Linear layer, but part_transformer's
-        # LayerNorm already renormalizes to unit scale, so the extra *100
-        # just overshoots and blew up the loss to NaN in practice
-        return self.fc(parts.reshape(batch_size, -1))
+        # *100: feature_matrix is L2-normalized (tiny values) in BAP; the
+        # original WS-DAN code scales it up before this single Linear
+        # layer so gradients/logits start in a sane range.
+        return self.fc(feature_matrix * 100.)
 
     def visualize(self, x):
         batch_size = x.size(0)
