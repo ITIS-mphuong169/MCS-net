@@ -2,7 +2,11 @@
 # Training Config
 ##################################################
 workers = 4  # number of Dataloader workers
-epochs = 100  # number of epochs
+epochs = 30  # number of epochs (reduced from the paper's 100 - free GPU
+# quota can't realistically cover 100 epochs for 2 branches being compared;
+# 30 is enough to see a clear convergence trend while staying achievable.
+# Both exp/full-paper-baseline and exp/full-paper-self-attention use the
+# same value so the comparison between them stays fair)
 batch_size = 16  # batch size (reduced from paper's 32: AGM+SCLM combined
 # push a 15GB GPU right to its limit at batch 32, with OOM recurring a few
 # batches in even after the AGM memory fix + CUDA allocator tuning. Kept
