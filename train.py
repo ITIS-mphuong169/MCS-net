@@ -108,7 +108,8 @@ def main():
     logs = {}
     start_epoch = 0
     net = WSDAN_MCS(num_classes=num_classes, M=config.num_attentions, net=config.net, pretrained=True)
-
+    
+    config.ckpt = '/kaggle/working/FGVC/wikiart_fullpaper/model1.ckpt'
     if config.ckpt and os.path.isfile(config.ckpt):
         # Load ckpt and get state_dict
         # weights_only=False: PyTorch >=2.6 defaults to True, which
