@@ -147,6 +147,16 @@ def main():
     optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
 
+    # Restore optimizer/scheduler state on resume (momentum buffers, LR
+    # decay progress) - checkpoints from before this fix won't have these
+    # keys, so this is a no-op for them (falls back to fresh state, same
+    # as before).
+    if config.ckpt and os.path.isfile(config.ckpt):
+        if 'optimizer_state' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state'])
+        if 'scheduler_state' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state'])
+
     # Model checkpoint
     callback_monitor = 'val_{}'.format(raw_metric.name)
     callback = ModelCheckpoint(savepath=os.path.join(config.save_dir, config.model_name),
@@ -204,8 +214,6 @@ def main():
                 "train/crop_top5": logs['train_crop_topk_accuracy'][1],
                 "train/drop_top1": logs['train_drop_topk_accuracy'][0],
                 "train/drop_top5": logs['train_drop_topk_accuracy'][1],
-                "train/rel_top1": logs['train_rel_topk_accuracy'][0],
-                "train/rel_top5": logs['train_rel_topk_accuracy'][1],
                 "val/loss": logs['val_loss'],
                 "val/top1": logs['val_topk_accuracy'][0],
                 "val/top5": logs['val_topk_accuracy'][1],
@@ -220,7 +228,7 @@ def main():
             scheduler.step(logs['val_loss'])
         else:
             scheduler.step()
-        callback.on_epoch_end(logs, net)
+        callback.on_epoch_end(logs, net, optimizer=optimizer, scheduler=scheduler)
         pbar.close()
 
     wandb.finish()
