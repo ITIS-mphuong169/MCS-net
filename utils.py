@@ -119,18 +119,23 @@ class ModelCheckpoint(Callback):
             for key in state_dict.keys():
                 state_dict[key] = state_dict[key].cpu()
 
+            save_dict = {'logs': logs, 'state_dict': state_dict}
+
             if 'feature_center' in kwargs:
                 feature_center = kwargs['feature_center']
-                feature_center = feature_center.cpu()
+                save_dict['feature_center'] = feature_center.cpu()
 
-                torch.save({
-                    'logs': logs,
-                    'state_dict': state_dict,
-                    'feature_center': feature_center}, self.savepath)
-            else:
-                torch.save({
-                    'logs': logs,
-                    'state_dict': state_dict}, self.savepath)
+            # Save optimizer/scheduler state too - without this, every
+            # resume restarts SGD momentum from 0 and the LR decay
+            # schedule from the beginning, discarding progress already
+            # made (confirmed as the cause of post-resume "dip then
+            # recover" patterns seen on runs with many resumes).
+            if 'optimizer' in kwargs:
+                save_dict['optimizer_state'] = kwargs['optimizer'].state_dict()
+            if 'scheduler' in kwargs:
+                save_dict['scheduler_state'] = kwargs['scheduler'].state_dict()
+
+            torch.save(save_dict, self.savepath)
 
 
 ##################################
