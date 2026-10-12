@@ -1,230 +1,115 @@
+"""Evaluate a trained checkpoint on the held-out test split.
+
+Usage (Kaggle):
+    INFER_CKPT=/path/to/model.ckpt python infer.py
+
+INFER_CKPT defaults to config.save_dir + config.model_name (the best-val
+checkpoint). Uses the same seed-1231 split as train.py, so the test images
+were never seen during training or checkpoint selection. Test-time
+augmentation (flip + 3 attention crops) follows the original author's code.
+"""
 import os
-import config_infer as config
+import json
 import time
-import logging
-import warnings
+import config
 from tqdm import tqdm
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchvision import transforms
 from models import WSDAN_MCS
-from datasets import get_trainval_datasets
-from utils import CenterLoss, AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment
+from utils import TopKAccuracyMetric, batch_augment
 from data_loader import get_data_loaders
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
 
 # GPU settings
 assert torch.cuda.is_available()
-os.environ['CUDA_VISIBLE_DEVICES'] = config.GPU
 device = torch.device("cuda")
 torch.backends.cudnn.benchmark = True
 
-# General loss functions
-cross_entropy_loss = nn.CrossEntropyLoss()
-center_loss = CenterLoss()
-
-# loss and metric
-loss_container = AverageMeter(name='loss')
-raw_metric = TopKAccuracyMetric(topk=(1, 5))
-crop_metric = TopKAccuracyMetric(topk=(1, 5))
-drop_metric = TopKAccuracyMetric(topk=(1, 5))
-
-best_acc = 0.0
-
-
-ToPILImage = transforms.ToPILImage()
-MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-
-
-def generate_heatmap(attention_maps):
-    heat_attention_maps = []
-    heat_attention_maps.append(attention_maps[:, 0, ...])  # R
-    heat_attention_maps.append(attention_maps[:, 0, ...] * (attention_maps[:, 0, ...] < 0.5).float() + \
-                               (1. - attention_maps[:, 0, ...]) * (attention_maps[:, 0, ...] >= 0.5).float())  # G
-    heat_attention_maps.append(1. - attention_maps[:, 0, ...])  # B
-    return torch.stack(heat_attention_maps, dim=1)
+DATA_DIR = "/kaggle/input/datasets/steubk/wikiart"
 
 
 def main():
-    # Load dataset
-    # _, test_dataset = get_trainval_datasets(config.tag, config.image_size)
-    # test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False,
-    #                          num_workers=config.workers, pin_memory=True)
-    dataloaders, dataset_sizes, class_names = get_data_loaders("/media/wjl/wjl/WYP/wangmeng/wikiart",
-                                                               batch_size=32)
-    test_loader = dataloaders['test']
-    num_classes = 27
-    # Initialize model
-    net = WSDAN_MCS(num_classes=num_classes, M=config.num_attentions, net=config.net, pretrained=True)
+    ckpt = os.environ.get('INFER_CKPT', config.save_dir + config.model_name)
+    out_dir = os.environ.get('INFER_OUT', config.save_dir)
+    os.makedirs(out_dir, exist_ok=True)
 
-    checkpoint = torch.load(config.ckpt)
+    dataloaders, dataset_sizes, class_names = get_data_loaders(DATA_DIR, batch_size=config.batch_size)
+    test_loader = dataloaders['test']
+    print('Test images: {}'.format(dataset_sizes['test']))
+
+    net = WSDAN_MCS(num_classes=len(class_names), M=config.num_attentions, net=config.net, pretrained=False)
+    checkpoint = torch.load(ckpt, weights_only=False, map_location='cpu')
     state_dict = checkpoint['state_dict']
+    # WSDAN_MCS.load_state_dict silently skips mismatched keys, so check
+    # here that the checkpoint really matches this branch's model.
+    missing = [k for k in net.state_dict() if k not in state_dict]
+    assert not missing, 'Checkpoint does not match this model (wrong branch?): missing {}'.format(missing[:5])
     net.load_state_dict(state_dict)
-    print('Network loaded from {}'.format(config.ckpt))
+    ckpt_epoch = checkpoint.get('logs', {}).get('epoch')
+    print('Network loaded from {} @ epoch {}'.format(ckpt, ckpt_epoch))
 
     net.to(device)
     if torch.cuda.device_count() > 1:
         net = nn.DataParallel(net)
 
-    # if config.visual_path is not None:
-    #     visualize(data_loader=test_loader, net=net)
+    results = evaluate(test_loader, net, class_names)
+    results.update({'checkpoint': ckpt, 'epoch': ckpt_epoch, 'branch': config.tag})
 
-    validate(data_loader=test_loader, net=net)
+    out_path = os.path.join(out_dir, 'test_results.json')
+    with open(out_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print('Saved to {}'.format(out_path))
 
 
-def visualize(**kwargs):
-    data_loader = kwargs['data_loader']
-    net = kwargs['net']
+def evaluate(data_loader, net, class_names):
+    metric = TopKAccuracyMetric(topk=(1, 5))
+    all_preds, all_labels = [], []
 
-    # metrics initialization
-    loss_container.reset()
-    raw_metric.reset()
-    drop_metric.reset()
-
-    # begin validation
-    start_time = time.time()
-    net.eval()
-
-    savepath = config.visual_path  # './vis_counterfactual/'
-
-    if not os.path.isdir(savepath):
-        os.mkdir(savepath)
-
-    with torch.no_grad():
-        for i, (X, y) in enumerate(data_loader):
-            X = X.to(device)
-
-            attention_maps = net.visualize(X)
-            attention_maps = torch.max(attention_maps, dim=1, keepdim=True)[0]
-            attention_maps = F.upsample_bilinear(attention_maps, size=(X.size(2), X.size(3)))
-            attention_maps = torch.sqrt(attention_maps.cpu() / attention_maps.max().item())
-
-            # get heat attention maps
-            heat_attention_maps = generate_heatmap(attention_maps)
-
-            # raw_image, heat_attention, raw_attention
-            raw_image = X.cpu() * STD + MEAN
-            heat_attention_image = raw_image * 0.5 + heat_attention_maps * 0.5
-            raw_attention_image = raw_image * attention_maps
-
-            for batch_idx in range(X.size(0)):
-                rimg = ToPILImage(raw_image[batch_idx])
-                # raimg = ToPILImage(raw_attention_image[batch_idx])
-                haimg = ToPILImage(heat_attention_image[batch_idx])
-                rimg.save(os.path.join(savepath, '%03d_raw.jpg' % (i * config.batch_size + batch_idx)))
-                # raimg.save(os.path.join(savepath, '%03d_raw_atten.jpg' % (i * config.batch_size + batch_idx)))
-                haimg.save(os.path.join(savepath, '%03d_heat_atten.jpg' % (i * config.batch_size + batch_idx)))
-
-            print('iter %d / %d done!' % (i, len(data_loader)))
-
-def validate(**kwargs):
-    data_loader = kwargs['data_loader']
-    net = kwargs['net']
-
-    # metrics initialization
-    loss_container.reset()
-    raw_metric.reset()
-    drop_metric.reset()
-
-    all_preds = []
-    all_labels = []
-
-    # begin validation
     start_time = time.time()
     net.eval()
     with torch.no_grad():
-        for i, (X, y) in enumerate(data_loader):
-            # obtain data
+        for X, y in tqdm(data_loader, unit=' batches'):
             X = X.to(device)
             y = y.to(device)
-
             X_m = torch.flip(X, [3])
 
-            ##################################
-            # Raw Image
-            ##################################
-            y_pred_raw, y_pred_aux_raw, _, _, attention_map, _ = net(X)
-            y_pred_raw_m, y_pred_aux_raw_m, _, _, attention_map_m, _ = net(X_m)
+            # model returns (p, p_effect, feature_matrix, attention_map, h)
+            y_pred_raw, _, _, attention_map, _ = net(X)
+            y_pred_raw_m, _, _, attention_map_m, _ = net(X_m)
 
-            ##################################
-            # Object Localization and Refinement
-            ##################################
+            preds, preds_m = [y_pred_raw], [y_pred_raw_m]
+            for theta, pad in ((0.3, 0.1), (0.2, 0.1), (0.1, 0.05)):
+                preds.append(net(batch_augment(X, attention_map, mode='crop', theta=theta, padding_ratio=pad))[0])
+                preds_m.append(net(batch_augment(X_m, attention_map_m, mode='crop', theta=theta, padding_ratio=pad))[0])
 
-            crop_images = batch_augment(X, attention_map, mode='crop', theta=0.3, padding_ratio=0.1)
-            y_pred_crop, y_pred_aux_crop, _, _, _, _ = net(crop_images)
+            y_pred = (torch.stack(preds).mean(0) + torch.stack(preds_m).mean(0)) / 2.
 
-            crop_images2 = batch_augment(X, attention_map, mode='crop', theta=0.2, padding_ratio=0.1)
-            y_pred_crop2, y_pred_aux_crop2, _, _, _, _ = net(crop_images2)
-
-            crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop3, y_pred_aux_crop3, _, _, _, _ = net(crop_images3)
-
-            crop_images_m = batch_augment(X_m, attention_map_m, mode='crop', theta=0.3, padding_ratio=0.1)
-            y_pred_crop_m, y_pred_aux_crop_m, _, _, _, _ = net(crop_images_m)
-
-            crop_images_m2 = batch_augment(X_m, attention_map_m, mode='crop', theta=0.2, padding_ratio=0.1)
-            y_pred_crop_m2, y_pred_aux_crop_m2, _, _, _, _ = net(crop_images_m2)
-
-            crop_images_m3 = batch_augment(X_m, attention_map_m, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop_m3, y_pred_aux_crop_m3, _, _, _, _ = net(crop_images_m3)
-
-            y_pred = (y_pred_raw + y_pred_crop + y_pred_crop2 + y_pred_crop3) / 4.
-            y_pred_m = (y_pred_raw_m + y_pred_crop_m + y_pred_crop_m2 + y_pred_crop_m3) / 4.
-            y_pred = (y_pred + y_pred_m) / 2.
-
-            y_pred_aux = (y_pred_aux_raw + y_pred_aux_crop + y_pred_aux_crop2 + y_pred_aux_crop3) / 4.
-            y_pred_aux_m = (y_pred_aux_raw_m + y_pred_aux_crop_m + y_pred_aux_crop_m2 + y_pred_aux_crop_m3) / 4.
-            y_pred_aux = (y_pred_aux + y_pred_aux_m) / 2.
-
-            # 收集预测结果和真实标签
-            _, preds = torch.max(y_pred, 1)
-            all_preds.extend(preds.cpu().numpy())
+            metric(y_pred, y)
+            all_preds.extend(y_pred.argmax(1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
 
-            # loss
-            batch_loss = cross_entropy_loss(y_pred, y)
-            epoch_loss = loss_container(batch_loss.item())
+    _, top5 = metric.corrects * 100. / metric.num_samples
+    results = {
+        'accuracy': accuracy_score(all_labels, all_preds),
+        'top5_accuracy': top5 / 100.,
+        'precision_macro': precision_score(all_labels, all_preds, average='macro', zero_division=0),
+        'recall_macro': recall_score(all_labels, all_preds, average='macro', zero_division=0),
+        'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0),
+        'precision_weighted': precision_score(all_labels, all_preds, average='weighted', zero_division=0),
+        'recall_weighted': recall_score(all_labels, all_preds, average='weighted', zero_division=0),
+        'f1_weighted': f1_score(all_labels, all_preds, average='weighted', zero_division=0),
+        'num_test_images': len(all_labels),
+    }
 
-            # metrics: top-1,5 error
-            epoch_acc = raw_metric(y_pred, y)
-            aux_acc = drop_metric(y_pred_aux, y)
-
-            batch_info = 'Val Loss {:.4f}, Val Acc ({:.2f}, {:.2f}), Val Aux Acc ({:.2f}, {:.2f}), Best {:.2f}'.format(
-                epoch_loss, epoch_acc[0], epoch_acc[1], aux_acc[0], aux_acc[1], best_acc)
-            if i % 5 == 0:
-                print('%d/%d:' % (i, len(data_loader)), batch_info)
-
-    # 计算各种指标
-    accuracy = accuracy_score(all_labels, all_preds)
-    print(f"Accuracy: {accuracy:.4f}")
-
-    precision_macro = precision_score(all_labels, all_preds, average='macro')
-    recall_macro = recall_score(all_labels, all_preds, average='macro')
-    f1_macro = f1_score(all_labels, all_preds, average='macro')
-    print(f"Precision (Macro): {precision_macro:.4f}")
-    print(f"Recall (Macro): {recall_macro:.4f}")
-    print(f"F1 Score (Macro): {f1_macro:.4f}")
-
-    precision_weighted = precision_score(all_labels, all_preds, average='weighted')
-    recall_weighted = recall_score(all_labels, all_preds, average='weighted')
-    f1_weighted = f1_score(all_labels, all_preds, average='weighted')
-    print(f"Precision (Weighted): {precision_weighted:.4f}")
-    print(f"Recall (Weighted): {recall_weighted:.4f}")
-    print(f"F1 Score (Weighted): {f1_weighted:.4f}")
-
-    precision_per_class = precision_score(all_labels, all_preds, average=None)
-    recall_per_class = recall_score(all_labels, all_preds, average=None)
-    f1_per_class = f1_score(all_labels, all_preds, average=None)
-    print(f"Precision per Class: {precision_per_class}")
-    print(f"Recall per Class: {recall_per_class}")
-    print(f"F1 Score per Class: {f1_per_class}")
-
-    batch_info = 'Val Loss {:.4f}, Val Acc ({:.2f}, {:.2f}), Val Aux Acc ({:.2f}, {:.2f}), Best {:.2f}'.format(
-        epoch_loss, epoch_acc[0], epoch_acc[1], aux_acc[0], aux_acc[1], best_acc)
-    print(batch_info)
+    print('\nTime {:.0f}s'.format(time.time() - start_time))
+    for k, v in results.items():
+        print('{:20s} {}'.format(k, round(v, 4) if isinstance(v, float) else v))
+    print('\n' + classification_report(all_labels, all_preds, labels=list(range(len(class_names))),
+                                       target_names=class_names, digits=4, zero_division=0))
+    results['per_class'] = classification_report(all_labels, all_preds, labels=list(range(len(class_names))),
+                                                 target_names=class_names, output_dict=True, zero_division=0)
+    return results
 
 
 if __name__ == '__main__':
