@@ -59,6 +59,7 @@ def seed_torch(seed=1231):
 
 
 def main():
+    global best_acc
     seed_torch(1231)
     # Logging setting
     if not os.path.exists(config.save_dir):
@@ -109,6 +110,14 @@ def main():
     start_epoch = 0
     net = WSDAN_MCS(num_classes=num_classes, M=config.num_attentions, net=config.net, pretrained=True)
 
+    # Resume priority: RESUME_CKPT env var > last.ckpt (written every
+    # epoch) > config.ckpt (best-only). model.ckpt is only rewritten when
+    # val acc improves, so resuming from it can silently redo epochs.
+    last_ckpt = os.path.join(config.save_dir, 'last.ckpt')
+    if os.environ.get('RESUME_CKPT'):
+        config.ckpt = os.environ['RESUME_CKPT']
+    elif os.path.isfile(last_ckpt):
+        config.ckpt = last_ckpt
     if config.ckpt and os.path.isfile(config.ckpt):
         # Load ckpt and get state_dict
         # weights_only=False: PyTorch >=2.6 defaults to True, which
@@ -162,7 +171,10 @@ def main():
     callback = ModelCheckpoint(savepath=os.path.join(config.save_dir, config.model_name),
                                monitor=callback_monitor,
                                mode='max')
-    if callback_monitor in logs:
+    if config.ckpt and os.path.isfile(config.ckpt) and 'best_score' in checkpoint:
+        callback.set_best_score(checkpoint['best_score'])
+        best_acc = checkpoint.get('best_acc', best_acc)
+    elif callback_monitor in logs:
         callback.set_best_score(logs[callback_monitor])
     else:
         callback.reset()
@@ -229,6 +241,18 @@ def main():
         else:
             scheduler.step()
         callback.on_epoch_end(logs, net, optimizer=optimizer, scheduler=scheduler)
+
+        # Always save the latest epoch so the next session resumes exactly
+        # here (the best-only model.ckpt may lag several epochs behind).
+        state_dict = net.module.state_dict() if isinstance(net, nn.DataParallel) else net.state_dict()
+        torch.save({
+            'logs': logs,
+            'state_dict': {k: v.cpu() for k, v in state_dict.items()},
+            'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
+            'best_score': callback.best_score,
+            'best_acc': best_acc,
+        }, last_ckpt)
         pbar.close()
 
     wandb.finish()
