@@ -13,7 +13,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 import random
 from models import WSDAN_MCS
@@ -58,6 +58,23 @@ def seed_torch(seed=1231):
     torch.backends.cudnn.deterministic = True
 
 
+# Ablation switches (all default to the normal full-paper run):
+#   ABLATION_TAG    - separate save_dir and W&B run, so ablations never touch
+#                     the main run's checkpoints or charts
+#   TRAIN_FRACTION  - train on this fraction of the train split (val is full)
+#   LAMBDA1         - override config.lambda1 (SCLM contrastive weight)
+#   AUG_CE_WEIGHT   - weight of CE on the attention crop/drop images, the
+#                     WS-DAN term dropped when the loss was matched to eq. 17
+ABLATION_TAG = os.environ.get('ABLATION_TAG', '')
+TRAIN_FRACTION = float(os.environ.get('TRAIN_FRACTION', 1.0))
+AUG_CE_WEIGHT = float(os.environ.get('AUG_CE_WEIGHT', 0.0))
+if 'LAMBDA1' in os.environ:
+    config.lambda1 = float(os.environ['LAMBDA1'])
+if ABLATION_TAG:
+    config.save_dir = config.save_dir.rstrip('/') + '_abl_{}/'.format(ABLATION_TAG)
+    config.ckpt = config.save_dir + config.model_name
+
+
 def main():
     global best_acc
     seed_torch(1231)
@@ -77,7 +94,8 @@ def main():
     # W&B run instead of starting a new one.
     wandb.init(
         project="mcs-net-wikiart",
-        id="{}-{}-v2".format(config.tag, config.net),
+        id="{}-{}-abl-{}".format(config.tag, config.net, ABLATION_TAG) if ABLATION_TAG
+        else "{}-{}-v2".format(config.tag, config.net),
         resume="allow",
         config={
             "epochs": config.epochs,
@@ -88,6 +106,9 @@ def main():
             "lambda1": config.lambda1,
             "lambda2": config.lambda2,
             "tau": config.tau,
+            "ablation_tag": ABLATION_TAG,
+            "train_fraction": TRAIN_FRACTION,
+            "aug_ce_weight": AUG_CE_WEIGHT,
         },
     )
 
@@ -103,6 +124,13 @@ def main():
                                                                batch_size=config.batch_size)
     train_loader = dataloaders['train']
     validate_loader = dataloaders['val']
+    if TRAIN_FRACTION < 1.0:
+        # the split is already seed-shuffled, so the first k images are a
+        # random sample - identical across ablation runs
+        train_subset = Subset(train_loader.dataset, range(int(len(train_loader.dataset) * TRAIN_FRACTION)))
+        train_loader = DataLoader(train_subset, batch_size=config.batch_size, shuffle=True,
+                                  num_workers=config.workers, pin_memory=True, drop_last=True)
+    print('Train images: {}, val images: {}'.format(len(train_loader.dataset), len(validate_loader.dataset)))
     num_classes = 27
 
     # Initialize model
@@ -326,6 +354,8 @@ def train(**kwargs):
         Lcausal = cross_entropy_loss(y_pred_aux, y_aux)
         Lcon = contrastive_loss(h, y)
         batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda1 * Lcon
+        if AUG_CE_WEIGHT:
+            batch_loss = batch_loss + AUG_CE_WEIGHT * cross_entropy_loss(y_pred_aug, y_aug)
 
         # backward
         batch_loss.backward()
