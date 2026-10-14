@@ -6,7 +6,9 @@ Usage (Kaggle):
 INFER_CKPT defaults to config.save_dir + config.model_name (the best-val
 checkpoint). Uses the same seed-1231 split as train.py, so the test images
 were never seen during training or checkpoint selection. Test-time
-augmentation (flip + 3 attention crops) follows the original author's code.
+augmentation (flip + 3 attention crops) follows the original author's code;
+results are reported both with it and with a single center crop (the
+protocol the paper describes).
 """
 import os
 import json
@@ -63,8 +65,12 @@ def main():
 
 
 def evaluate(data_loader, net, class_names):
-    metric = TopKAccuracyMetric(topk=(1, 5))
-    all_preds, all_labels = [], []
+    """One pass, two protocols: 'center_crop' (single center-cropped view,
+    as the paper's sec. 3.3 describes) and 'tta' (the original author code's
+    flip + 3 attention-crop averaging)."""
+    preds = {'center_crop': [], 'tta': []}
+    top5 = {k: TopKAccuracyMetric(topk=(1, 5)) for k in preds}
+    all_labels = []
 
     start_time = time.time()
     net.eval()
@@ -78,37 +84,41 @@ def evaluate(data_loader, net, class_names):
             y_pred_raw, _, _, attention_map, _ = net(X)
             y_pred_raw_m, _, _, attention_map_m, _ = net(X_m)
 
-            preds, preds_m = [y_pred_raw], [y_pred_raw_m]
+            views, views_m = [y_pred_raw], [y_pred_raw_m]
             for theta, pad in ((0.3, 0.1), (0.2, 0.1), (0.1, 0.05)):
-                preds.append(net(batch_augment(X, attention_map, mode='crop', theta=theta, padding_ratio=pad))[0])
-                preds_m.append(net(batch_augment(X_m, attention_map_m, mode='crop', theta=theta, padding_ratio=pad))[0])
+                views.append(net(batch_augment(X, attention_map, mode='crop', theta=theta, padding_ratio=pad))[0])
+                views_m.append(net(batch_augment(X_m, attention_map_m, mode='crop', theta=theta, padding_ratio=pad))[0])
+            y_pred_tta = (torch.stack(views).mean(0) + torch.stack(views_m).mean(0)) / 2.
 
-            y_pred = (torch.stack(preds).mean(0) + torch.stack(preds_m).mean(0)) / 2.
-
-            metric(y_pred, y)
-            all_preds.extend(y_pred.argmax(1).cpu().numpy())
+            for name, y_pred in (('center_crop', y_pred_raw), ('tta', y_pred_tta)):
+                top5[name](y_pred, y)
+                preds[name].extend(y_pred.argmax(1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
 
-    _, top5 = metric.corrects * 100. / metric.num_samples
-    results = {
-        'accuracy': accuracy_score(all_labels, all_preds),
-        'top5_accuracy': top5 / 100.,
-        'precision_macro': precision_score(all_labels, all_preds, average='macro', zero_division=0),
-        'recall_macro': recall_score(all_labels, all_preds, average='macro', zero_division=0),
-        'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0),
-        'precision_weighted': precision_score(all_labels, all_preds, average='weighted', zero_division=0),
-        'recall_weighted': recall_score(all_labels, all_preds, average='weighted', zero_division=0),
-        'f1_weighted': f1_score(all_labels, all_preds, average='weighted', zero_division=0),
-        'num_test_images': len(all_labels),
-    }
+    print('\nTime {:.0f}s, {} test images'.format(time.time() - start_time, len(all_labels)))
+    labels = list(range(len(class_names)))
+    results = {'num_test_images': len(all_labels)}
+    for name, p in preds.items():
+        r = {
+            'accuracy': accuracy_score(all_labels, p),
+            'top5_accuracy': top5[name].corrects[1] / top5[name].num_samples,
+            'precision_macro': precision_score(all_labels, p, average='macro', zero_division=0),
+            'recall_macro': recall_score(all_labels, p, average='macro', zero_division=0),
+            'f1_macro': f1_score(all_labels, p, average='macro', zero_division=0),
+            'precision_weighted': precision_score(all_labels, p, average='weighted', zero_division=0),
+            'recall_weighted': recall_score(all_labels, p, average='weighted', zero_division=0),
+            'f1_weighted': f1_score(all_labels, p, average='weighted', zero_division=0),
+        }
+        print('\n=== {} ==='.format(name))
+        for k, v in r.items():
+            print('{:20s} {:.4f}'.format(k, v))
+        r['per_class'] = classification_report(all_labels, p, labels=labels, target_names=class_names,
+                                               output_dict=True, zero_division=0)
+        results[name] = r
 
-    print('\nTime {:.0f}s'.format(time.time() - start_time))
-    for k, v in results.items():
-        print('{:20s} {}'.format(k, round(v, 4) if isinstance(v, float) else v))
-    print('\n' + classification_report(all_labels, all_preds, labels=list(range(len(class_names))),
-                                       target_names=class_names, digits=4, zero_division=0))
-    results['per_class'] = classification_report(all_labels, all_preds, labels=list(range(len(class_names))),
-                                                 target_names=class_names, output_dict=True, zero_division=0)
+    print('\n=== per-class report (center_crop) ===')
+    print(classification_report(all_labels, preds['center_crop'], labels=labels,
+                                target_names=class_names, digits=4, zero_division=0))
     return results
 
 
