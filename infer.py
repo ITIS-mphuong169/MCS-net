@@ -29,6 +29,8 @@ device = torch.device("cuda")
 torch.backends.cudnn.benchmark = True
 
 DATA_DIR = "/kaggle/input/datasets/steubk/wikiart"
+# INFER_TTA=0 skips the 7 extra TTA forward passes (~8x faster, center crop only)
+USE_TTA = os.environ.get('INFER_TTA', '1') != '0'
 
 
 def main():
@@ -68,7 +70,7 @@ def evaluate(data_loader, net, class_names):
     """One pass, two protocols: 'center_crop' (single center-cropped view,
     as the paper's sec. 3.3 describes) and 'tta' (the original author code's
     flip + 3 attention-crop averaging)."""
-    preds = {'center_crop': [], 'tta': []}
+    preds = {'center_crop': [], 'tta': []} if USE_TTA else {'center_crop': []}
     top5 = {k: TopKAccuracyMetric(topk=(1, 5)) for k in preds}
     all_labels = []
 
@@ -82,15 +84,17 @@ def evaluate(data_loader, net, class_names):
 
             # model returns (p, p_effect, feature_matrix, attention_map, h)
             y_pred_raw, _, _, attention_map, _ = net(X)
-            y_pred_raw_m, _, _, attention_map_m, _ = net(X_m)
+            outputs = {'center_crop': y_pred_raw}
 
-            views, views_m = [y_pred_raw], [y_pred_raw_m]
-            for theta, pad in ((0.3, 0.1), (0.2, 0.1), (0.1, 0.05)):
-                views.append(net(batch_augment(X, attention_map, mode='crop', theta=theta, padding_ratio=pad))[0])
-                views_m.append(net(batch_augment(X_m, attention_map_m, mode='crop', theta=theta, padding_ratio=pad))[0])
-            y_pred_tta = (torch.stack(views).mean(0) + torch.stack(views_m).mean(0)) / 2.
+            if USE_TTA:
+                y_pred_raw_m, _, _, attention_map_m, _ = net(X_m)
+                views, views_m = [y_pred_raw], [y_pred_raw_m]
+                for theta, pad in ((0.3, 0.1), (0.2, 0.1), (0.1, 0.05)):
+                    views.append(net(batch_augment(X, attention_map, mode='crop', theta=theta, padding_ratio=pad))[0])
+                    views_m.append(net(batch_augment(X_m, attention_map_m, mode='crop', theta=theta, padding_ratio=pad))[0])
+                outputs['tta'] = (torch.stack(views).mean(0) + torch.stack(views_m).mean(0)) / 2.
 
-            for name, y_pred in (('center_crop', y_pred_raw), ('tta', y_pred_tta)):
+            for name, y_pred in outputs.items():
                 top5[name](y_pred, y)
                 preds[name].extend(y_pred.argmax(1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
