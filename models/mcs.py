@@ -1,4 +1,5 @@
 import logging
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -273,6 +274,93 @@ class TransformerFeatures(nn.Module):
         return feat
 
 
+
+class LatentAttentionEncoderLayer(nn.Module):
+    """Drop-in replacement for nn.TransformerEncoderLayer (post-norm, ReLU,
+    batch_first) whose keys and values go through a shared low-rank latent,
+    as in DeepSeek's Multi-head Latent Attention (MLA):
+        c = W_down x  (rank r),   K = W_uk c,   V = W_uv c
+    Queries keep a full projection. The part tokens carry no positional
+    encoding, so MLA's decoupled-RoPE path is not needed here.
+
+    linear1/linear2/norm1/norm2 use the same names as nn.TransformerEncoderLayer
+    so a trained MHA checkpoint maps onto it (see convert_mha_to_mla)."""
+
+    def __init__(self, d_model, nhead, dim_feedforward, rank, dropout=0.1):
+        super(LatentAttentionEncoderLayer, self).__init__()
+        self.nhead = nhead
+        self.d_head = d_model // nhead
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.kv_down = nn.Linear(d_model, rank, bias=False)
+        self.k_up = nn.Linear(rank, d_model)
+        self.v_up = nn.Linear(rank, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def _heads(self, t):
+        B, N, _ = t.size()
+        return t.view(B, N, self.nhead, self.d_head).transpose(1, 2)
+
+    def _sa_block(self, x):
+        B, N, D = x.size()
+        c = self.kv_down(x)
+        q, k, v = self._heads(self.q_proj(x)), self._heads(self.k_up(c)), self._heads(self.v_up(c))
+        attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / self.d_head ** 0.5, dim=-1)
+        out = torch.matmul(self.attn_dropout(attn), v).transpose(1, 2).reshape(B, N, D)
+        return self.dropout1(self.out_proj(out))
+
+    def forward(self, x):
+        x = self.norm1(x + self._sa_block(x))
+        x = self.norm2(x + self.dropout2(self.linear2(self.dropout(F.relu(self.linear1(x))))))
+        return x
+
+
+class LatentAttentionEncoder(nn.Module):
+    """Keeps nn.TransformerEncoder's 'layers.<i>.' key prefix."""
+
+    def __init__(self, layer):
+        super(LatentAttentionEncoder, self).__init__()
+        self.layers = nn.ModuleList([layer])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def convert_mha_to_mla(state_dict, rank, prefix='part_transformer.layers.0.'):
+    """MHA2MLA-style init (Ji et al., ACL 2025): factor the trained key and
+    value projections jointly with SVD, [W_k; W_v] ~= U_r S_r V_r^T, so
+    W_down = sqrt(S_r) V_r^T and [W_uk; W_uv] = U_r sqrt(S_r). Returns the
+    converted state dict and the fraction of [W_k; W_v]'s energy kept."""
+    sd = dict(state_dict)
+    in_w = sd.pop(prefix + 'self_attn.in_proj_weight')
+    in_b = sd.pop(prefix + 'self_attn.in_proj_bias')
+    d = in_w.size(1)
+    w_q, w_k, w_v = in_w[:d], in_w[d:2 * d], in_w[2 * d:]
+    b_q, b_k, b_v = in_b[:d], in_b[d:2 * d], in_b[2 * d:]
+
+    U, S, Vh = torch.linalg.svd(torch.cat([w_k, w_v], dim=0).float(), full_matrices=False)
+    root = S[:rank].sqrt()
+    up = U[:, :rank] * root
+
+    sd[prefix + 'q_proj.weight'], sd[prefix + 'q_proj.bias'] = w_q, b_q
+    sd[prefix + 'kv_down.weight'] = root[:, None] * Vh[:rank]
+    sd[prefix + 'k_up.weight'], sd[prefix + 'k_up.bias'] = up[:d], b_k
+    sd[prefix + 'v_up.weight'], sd[prefix + 'v_up.bias'] = up[d:], b_v
+    sd[prefix + 'out_proj.weight'] = sd.pop(prefix + 'self_attn.out_proj.weight')
+    sd[prefix + 'out_proj.bias'] = sd.pop(prefix + 'self_attn.out_proj.bias')
+    energy = (S[:rank] ** 2).sum() / (S ** 2).sum()
+    return sd, energy.item()
+
+
 class WSDAN_MCS(nn.Module):
     def __init__(self, num_classes, M=32, net='inception_mixed_6e', pretrained=False):
         super(WSDAN_MCS, self).__init__()
@@ -331,14 +419,21 @@ class WSDAN_MCS(nn.Module):
         # raw/crop/drop forward passes per training step).
         part_dim = 256
         self.part_proj = nn.Linear(self.num_features, part_dim)
-        self.part_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=part_dim, nhead=8,
-                dim_feedforward=part_dim * 2,
-                batch_first=True,
-            ),
-            num_layers=1,
-        )
+        # MLA_RANK > 0 swaps standard multi-head attention for latent
+        # (low-rank key/value) attention of that rank; 0 keeps plain MHA.
+        self.mla_rank = int(os.environ.get('MLA_RANK', 0))
+        if self.mla_rank > 0:
+            self.part_transformer = LatentAttentionEncoder(LatentAttentionEncoderLayer(
+                d_model=part_dim, nhead=8, dim_feedforward=part_dim * 2, rank=self.mla_rank))
+        else:
+            self.part_transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=part_dim, nhead=8,
+                    dim_feedforward=part_dim * 2,
+                    batch_first=True,
+                ),
+                num_layers=1,
+            )
         # Classification Layer
         self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)
 

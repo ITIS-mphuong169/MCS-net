@@ -70,6 +70,14 @@ TRAIN_FRACTION = float(os.environ.get('TRAIN_FRACTION', 1.0))
 AUG_CE_WEIGHT = float(os.environ.get('AUG_CE_WEIGHT', 0.0))
 if 'LAMBDA1' in os.environ:
     config.lambda1 = float(os.environ['LAMBDA1'])
+#   EPOCHS          - override config.epochs (e.g. 32 to fine-tune past 30)
+#   FINETUNE_FROM   - start from this trained checkpoint with a fresh optimizer
+#                     (lr FT_LR); with MLA_RANK > 0 its MHA weights are
+#                     converted to latent attention by SVD (MHA2MLA)
+if 'EPOCHS' in os.environ:
+    config.epochs = int(os.environ['EPOCHS'])
+FINETUNE_FROM = os.environ.get('FINETUNE_FROM', '')
+FT_LR = float(os.environ.get('FT_LR', 5e-4))
 if ABLATION_TAG:
     config.save_dir = config.save_dir.rstrip('/') + '_abl_{}/'.format(ABLATION_TAG)
     config.ckpt = config.save_dir + config.model_name
@@ -109,6 +117,9 @@ def main():
             "ablation_tag": ABLATION_TAG,
             "train_fraction": TRAIN_FRACTION,
             "aug_ce_weight": AUG_CE_WEIGHT,
+            "mla_rank": int(os.environ.get('MLA_RANK', 0)),
+            "finetune_from": FINETUNE_FROM,
+            "ft_lr": FT_LR if FINETUNE_FROM else None,
         },
     )
 
@@ -146,6 +157,22 @@ def main():
         config.ckpt = os.environ['RESUME_CKPT']
     elif os.path.isfile(last_ckpt):
         config.ckpt = last_ckpt
+    elif FINETUNE_FROM:
+        # First session of a fine-tune: take the weights only. Optimizer,
+        # scheduler and best-score start fresh (config.ckpt = None below).
+        source = torch.load(FINETUNE_FROM, weights_only=False, map_location='cpu')
+        state_dict = source['state_dict']
+        if net.mla_rank > 0:
+            from models.mcs import convert_mha_to_mla
+            state_dict, energy = convert_mha_to_mla(state_dict, net.mla_rank)
+            print('MHA -> MLA rank {}: SVD keeps {:.2%} of [W_k; W_v] energy'.format(net.mla_rank, energy))
+        missing = [k for k in net.state_dict() if k not in state_dict]
+        assert not missing, 'FINETUNE_FROM does not match this model: missing {}'.format(missing[:5])
+        net.load_state_dict(state_dict)
+        start_epoch = int(source['logs']['epoch'])
+        config.ckpt = None
+        config.learning_rate = FT_LR
+        print('Fine-tuning from {} @ epoch {}, lr {}'.format(FINETUNE_FROM, start_epoch, FT_LR))
     if config.ckpt and os.path.isfile(config.ckpt):
         # Load ckpt and get state_dict
         # weights_only=False: PyTorch >=2.6 defaults to True, which
