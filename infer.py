@@ -60,6 +60,8 @@ def main():
     results = evaluate(test_loader, net, class_names)
     results.update({'checkpoint': ckpt, 'epoch': ckpt_epoch, 'branch': config.tag})
 
+    # per-image predictions, for paired significance tests (mcnemar.py)
+    np.savez(os.path.join(out_dir, 'predictions.npz'), **results.pop('_preds'))
     out_path = os.path.join(out_dir, 'test_results.json')
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=2)
@@ -119,6 +121,7 @@ def evaluate(data_loader, net, class_names):
         r['per_class'] = classification_report(all_labels, p, labels=labels, target_names=class_names,
                                                output_dict=True, zero_division=0)
         results[name] = r
+    results['_preds'] = dict(labels=np.array(all_labels), **{k: np.array(v) for k, v in preds.items()})
 
     print('\n=== per-class report (center_crop) ===')
     print(classification_report(all_labels, preds['center_crop'], labels=labels,
