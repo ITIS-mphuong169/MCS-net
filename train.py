@@ -33,6 +33,10 @@ torch.backends.cudnn.benchmark = True
 # General loss functions - matches the paper's eq. 17 (L = Lcls + l1*Lcon +
 # l2*Lcausal); no center_loss, the paper's loss doesn't have one
 cross_entropy_loss = nn.CrossEntropyLoss()
+# LABEL_SMOOTH=e: label smoothing on the training CE losses (validation and
+# test keep plain CE, so val/loss stays comparable); 0 = off
+LABEL_SMOOTH = float(os.environ.get('LABEL_SMOOTH', 0))
+train_ce = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
 contrastive_loss = StyleContrastiveLoss(temperature=config.tau)
 
 # loss and metric
@@ -69,6 +73,8 @@ ABLATION_TAG = os.environ.get('ABLATION_TAG', '')
 # SEED changes model init and data order only; the train/val/test split
 # keeps its own fixed seed (data_loader.py), so every seed sees the same images
 SEED = int(os.environ.get('SEED', 1231))
+# WEIGHT_DECAY: SGD weight decay (paper Table 2: 1e-5)
+WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', 1e-5))
 TRAIN_FRACTION = float(os.environ.get('TRAIN_FRACTION', 1.0))
 AUG_CE_WEIGHT = float(os.environ.get('AUG_CE_WEIGHT', 0.0))
 if 'LAMBDA1' in os.environ:
@@ -119,6 +125,12 @@ def main():
             "tau": config.tau,
             "ablation_tag": ABLATION_TAG,
             "seed": SEED,
+            "part_attn": config.PART_ATTN,
+            "aug_rotate": float(os.environ.get("AUG_ROTATE", 0)),
+            "feat_noise": float(os.environ.get("FEAT_NOISE", 0)),
+            "fc_dropout": float(os.environ.get("FC_DROPOUT", 0)),
+            "label_smooth": LABEL_SMOOTH,
+            "weight_decay": WEIGHT_DECAY,
             "train_fraction": TRAIN_FRACTION,
             "aug_ce_weight": AUG_CE_WEIGHT,
             "mla_rank": int(os.environ.get('MLA_RANK', 0)),
@@ -196,6 +208,13 @@ def main():
 
     logging.info('Network weights save to {}'.format(config.save_dir))
 
+    # Re-seed per starting epoch: with one fixed seed, every resumed session
+    # replayed the exact same shuffled + augmented images in its first epoch
+    # (seen as an inflated train acc right after each resume). From-scratch
+    # runs start at epoch 0, so their randomness is unchanged.
+    if start_epoch > 0:
+        seed_torch(SEED + start_epoch)
+
     # Use cuda
     net.to(device)
     if torch.cuda.device_count() > 1:
@@ -212,7 +231,7 @@ def main():
     # Optimizer
     learning_rate = config.learning_rate
     # print('begin with ', learning_rate, ' learning rate')
-    optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-5)
+    optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
 
     # Restore optimizer/scheduler state on resume (momentum buffers, LR
@@ -381,12 +400,12 @@ def train(**kwargs):
         # previously added as a 4th term here) is dropped - confirmed on
         # Kaggle to hurt accuracy regardless of which other modules were
         # present, in a dedicated A/B comparison.
-        Lcls = cross_entropy_loss(y_pred_raw, y)
-        Lcausal = cross_entropy_loss(y_pred_aux, y_aux)
+        Lcls = train_ce(y_pred_raw, y)
+        Lcausal = train_ce(y_pred_aux, y_aux)
         Lcon = contrastive_loss(h, y)
         batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda1 * Lcon
         if AUG_CE_WEIGHT:
-            batch_loss = batch_loss + AUG_CE_WEIGHT * cross_entropy_loss(y_pred_aug, y_aug)
+            batch_loss = batch_loss + AUG_CE_WEIGHT * train_ce(y_pred_aug, y_aug)
 
         # backward
         batch_loss.backward()

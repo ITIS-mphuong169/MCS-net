@@ -417,12 +417,21 @@ class WSDAN_MCS(nn.Module):
         # encoder at full num_features OOM'd a 15GB GPU (d_model=2048,
         # dim_feedforward=4096, x2 for real+counterfactual, x3 for the
         # raw/crop/drop forward passes per training step).
-        part_dim = 256
-        self.part_proj = nn.Linear(self.num_features, part_dim)
+        # PART_ATTN=0: paper baseline, parts concatenated straight into the FC
+        self.part_attn = os.environ.get('PART_ATTN', '1') != '0'
+        # FEAT_NOISE=g: BSFEM-style feature perturbation (paper eq. 2, gamma=0.1),
+        # F~ = F + g * std(F) * N(0,1), training only; 0 = off
+        self.feat_noise = float(os.environ.get('FEAT_NOISE', 0))
+        # FC_DROPOUT=p: dropout on the classifier input; 0 = off
+        self.fc_dropout = nn.Dropout(float(os.environ.get('FC_DROPOUT', 0)))
+        part_dim = 256 if self.part_attn else self.num_features
+        self.part_proj = nn.Linear(self.num_features, part_dim) if self.part_attn else None
         # MLA_RANK > 0 swaps standard multi-head attention for latent
         # (low-rank key/value) attention of that rank; 0 keeps plain MHA.
         self.mla_rank = int(os.environ.get('MLA_RANK', 0))
-        if self.mla_rank > 0:
+        if not self.part_attn:
+            self.part_transformer = None
+        elif self.mla_rank > 0:
             self.part_transformer = LatentAttentionEncoder(LatentAttentionEncoderLayer(
                 d_model=part_dim, nhead=8, dim_feedforward=part_dim * 2, rank=self.mla_rank))
         else:
@@ -442,6 +451,10 @@ class WSDAN_MCS(nn.Module):
                                                                                                self.M))
 
     def _classify(self, feature_matrix, batch_size):
+        if not self.part_attn:
+            # *100: feature_matrix is L2-normalized (tiny values) in BAP; the
+            # original WS-DAN code scales it up before this single Linear layer
+            return self.fc(self.fc_dropout(feature_matrix * 100.))
         parts = feature_matrix.view(batch_size, self.M, self.num_features)
         parts = self.part_proj(parts)
         parts = self.part_transformer(parts)
@@ -449,13 +462,16 @@ class WSDAN_MCS(nn.Module):
         # output before its single Linear layer, but part_transformer's
         # LayerNorm already renormalizes to unit scale, so the extra *100
         # just overshoots and blew up the loss to NaN in practice
-        return self.fc(parts.reshape(batch_size, -1))
+        return self.fc(self.fc_dropout(parts.reshape(batch_size, -1)))
 
     def visualize(self, x):
         batch_size = x.size(0)
 
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
+        if self.training and self.feat_noise > 0:
+            feature_maps = feature_maps + self.feat_noise * feature_maps.std(dim=(2, 3), keepdim=True) \
+                * torch.randn_like(feature_maps)
         if self.net != 'inception_mixed_7c':
             attention_maps = self.attentions(self.agm(feature_maps))
         else:

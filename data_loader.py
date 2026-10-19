@@ -157,6 +157,10 @@ def get_data_loaders(data_dir, batch_size=32, num_workers=4, val_split=0.1, test
         'train': transforms.Compose([
             transforms.RandomResizedCrop(224),   # ⚠️ 这一步会主动缩放和裁剪，是关键防护！
             transforms.RandomHorizontalFlip(),
+            # AUG_ROTATE=deg: random rotation, listed in the paper's training
+            # augmentation (sec. 3.3, angle not given); 0 = off
+            *([transforms.RandomRotation(float(os.environ['AUG_ROTATE']))]
+              if float(os.environ.get('AUG_ROTATE', 0)) > 0 else []),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ]),

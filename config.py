@@ -1,3 +1,5 @@
+import os
+
 ##################################################
 # Training Config
 ##################################################
@@ -38,6 +40,13 @@ tag = 'wikiart-fullpaper-selfattn'  # new tag: full paper modules (AGM+SCLM+
 
 # saving directory of .ckpt models
 save_dir = '/kaggle/working/FGVC/wikiart_fullpaper_selfattn/'
+# PART_ATTN=0 builds the paper's own baseline (32 parts concatenated straight
+# into the FC, no part-relationship module) from this same codebase, so the
+# two models differ only in that module
+PART_ATTN = os.environ.get('PART_ATTN', '1') != '0'
+if not PART_ATTN:
+    tag = 'wikiart-fullpaper-baseline'
+    save_dir = '/kaggle/working/FGVC/wikiart_fullpaper_baseline/'
 model_name = 'model.ckpt'
 log_name = 'train.log'
 
