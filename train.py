@@ -66,6 +66,9 @@ def seed_torch(seed=1231):
 #   AUG_CE_WEIGHT   - weight of CE on the attention crop/drop images, the
 #                     WS-DAN term dropped when the loss was matched to eq. 17
 ABLATION_TAG = os.environ.get('ABLATION_TAG', '')
+# SEED changes model init and data order only; the train/val/test split
+# keeps its own fixed seed (data_loader.py), so every seed sees the same images
+SEED = int(os.environ.get('SEED', 1231))
 TRAIN_FRACTION = float(os.environ.get('TRAIN_FRACTION', 1.0))
 AUG_CE_WEIGHT = float(os.environ.get('AUG_CE_WEIGHT', 0.0))
 if 'LAMBDA1' in os.environ:
@@ -77,7 +80,7 @@ if ABLATION_TAG:
 
 def main():
     global best_acc
-    seed_torch(1231)
+    seed_torch(SEED)
     # Logging setting
     if not os.path.exists(config.save_dir):
         os.makedirs(config.save_dir)
@@ -107,6 +110,7 @@ def main():
             "lambda2": config.lambda2,
             "tau": config.tau,
             "ablation_tag": ABLATION_TAG,
+            "seed": SEED,
             "train_fraction": TRAIN_FRACTION,
             "aug_ce_weight": AUG_CE_WEIGHT,
         },
