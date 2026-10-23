@@ -26,7 +26,7 @@ import wandb
 from data_loader import get_data_loaders
 # import thop
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
 device = torch.device("cuda")
 torch.backends.cudnn.benchmark = True
 
@@ -147,8 +147,9 @@ def main():
     #                                            num_workers=config.workers, pin_memory=True, drop_last=True)
     # num_classes = train_dataset.num_classes
 
-    dataloaders, dataset_sizes, class_names = get_data_loaders("/kaggle/input/datasets/steubk/wikiart",
-                                                               batch_size=config.batch_size)
+    dataloaders, dataset_sizes, class_names = get_data_loaders(config.DATA_DIR,
+                                                               batch_size=config.batch_size,
+                                                               num_workers=config.workers)
     train_loader = dataloaders['train']
     validate_loader = dataloaders['val']
     if TRAIN_FRACTION < 1.0:

@@ -28,7 +28,7 @@ assert torch.cuda.is_available()
 device = torch.device("cuda")
 torch.backends.cudnn.benchmark = True
 
-DATA_DIR = "/kaggle/input/datasets/steubk/wikiart"
+DATA_DIR = config.DATA_DIR
 # INFER_TTA=0 skips the 7 extra TTA forward passes (~8x faster, center crop only)
 USE_TTA = os.environ.get('INFER_TTA', '1') != '0'
 
