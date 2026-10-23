@@ -522,7 +522,7 @@ class WSDAN_MCS(nn.Module):
             # Randomly choose one of attention maps Ak
             attention_map = []
             for i in range(batch_size):
-                attention_weights = torch.sqrt(attention_maps[i].sum(dim=(1, 2)).detach() + EPSILON)
+                attention_weights = torch.sqrt(attention_maps[i].sum(dim=(1, 2)).detach().float() + EPSILON)
                 attention_weights = F.normalize(attention_weights, p=1, dim=0)
                 k_index = np.random.choice(self.M, 2, p=attention_weights.cpu().numpy())
                 attention_map.append(attention_maps[i, k_index, ...])

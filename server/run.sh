@@ -18,23 +18,31 @@ case $MODEL in
   *) echo "!! MODEL phai la smoke | base | mla64 | mha"; exit 1 ;;
 esac
 
-# batch 32 nhu bai bao neu GPU >= 24GB, nguoc lai 16
+# Batch hieu dung luon = 32 (nhu bai bao), tu chon theo bo nho GPU:
+#   >= 32GB : batch 32
+#   16-31GB : batch 16 x tich luy 2
+#   < 16GB  : batch 16 x tich luy 2 + bfloat16 (AMP) de vua bo nho
+# Ep tay bang BATCH_SIZE=, GRAD_ACCUM=, AMP= (vd het bo nho: BATCH_SIZE=8 GRAD_ACCUM=4 AMP=1)
 MEM=$(CUDA_VISIBLE_DEVICES=$GPU HIP_VISIBLE_DEVICES=$GPU "$ENV_DIR/bin/python" -c \
-  "import torch;print(int(torch.cuda.get_device_properties(0).total_memory/2**30))")
-BS=${BATCH_SIZE:-$([ "$MEM" -ge 24 ] && echo 32 || echo 16)}
+  "import torch;print(int(round(torch.cuda.get_device_properties(0).total_memory/2**30)))")
+if   [ "$MEM" -ge 32 ]; then D_BS=32; D_ACC=1; D_AMP=0
+elif [ "$MEM" -ge 16 ]; then D_BS=16; D_ACC=2; D_AMP=0
+else                         D_BS=16; D_ACC=2; D_AMP=1; fi
+BS=${BATCH_SIZE:-$D_BS}; ACC=${GRAD_ACCUM:-$D_ACC}; AMPV=${AMP:-$D_AMP}
 EPOCHS=$([ "$MODEL" = smoke ] && echo 1 || echo "${EPOCHS:-100}")
 
 mkdir -p "$HOME/runs"
 LOG="$HOME/runs/srv_$MODEL.log"
 CMD="cd '$REPO' && env CUDA_VISIBLE_DEVICES=$GPU HIP_VISIBLE_DEVICES=$GPU DATA_DIR='$DATA_DIR' SAVE_ROOT='$HOME/runs' \
-BATCH_SIZE=$BS WORKERS=${WORKERS:-6} EPOCHS=$EPOCHS SEED=${SEED:-1} AUG_ROTATE=15 FEAT_NOISE=0.1 GLOBAL_CLS=1 $ARCH \
+BATCH_SIZE=$BS GRAD_ACCUM=$ACC AMP=$AMPV WORKERS=${WORKERS:-6} EPOCHS=$EPOCHS SEED=${SEED:-1} AUG_ROTATE=15 FEAT_NOISE=0.1 GLOBAL_CLS=1 $ARCH \
 ABLATION_TAG=srv_$MODEL WANDB_ENTITY=phuongmt-b22cn641-h-c-vi-n-c-ng-ngh-b-u-ch-nh-vi-n-th-ng \
 '$ENV_DIR/bin/python' train.py 2>&1 | tee -a '$LOG'"
 
-echo ">> MODEL=$MODEL  GPU=$GPU (${MEM}GB)  batch=$BS  epochs=$EPOCHS  data=$DATA_DIR"
+echo ">> MODEL=$MODEL  GPU=$GPU (${MEM}GB)  batch=$BS x tich luy $ACC = $((BS*ACC))  AMP=$AMPV  epochs=$EPOCHS  data=$DATA_DIR"
 if [ "$MODEL" = smoke ]; then
   bash -c "$CMD"; rm -rf "$HOME"/runs/*srv_smoke*; echo ">> CHAY THU OK"; exit 0
 fi
+if [ "$3" = fg ]; then bash -c "$CMD"; exit 0; fi   # chay truc tiep (dung boi run_both.sh)
 if command -v tmux >/dev/null; then
   tmux new -d -s "srv_$MODEL" "$CMD"
   echo ">> Dang chay nen trong tmux 'srv_$MODEL'. Xem: tmux attach -t srv_$MODEL  (thoat: Ctrl+B roi D)"

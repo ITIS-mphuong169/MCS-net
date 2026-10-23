@@ -73,6 +73,12 @@ ABLATION_TAG = os.environ.get('ABLATION_TAG', '')
 # SEED changes model init and data order only; the train/val/test split
 # keeps its own fixed seed (data_loader.py), so every seed sees the same images
 SEED = int(os.environ.get('SEED', 1231))
+# Memory savers for small GPUs (both off by default):
+#   AMP=1         - bfloat16 autocast for forward passes (losses stay float32)
+#   GRAD_ACCUM=N  - step the optimizer every N batches, so the effective batch
+#                   is BATCH_SIZE * N (e.g. 16 x 2 = the paper's 32)
+AMP = os.environ.get('AMP', '0') != '0'
+GRAD_ACCUM = max(1, int(os.environ.get('GRAD_ACCUM', 1)))
 # WEIGHT_DECAY: SGD weight decay (paper Table 2: 1e-5)
 WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', 1e-5))
 TRAIN_FRACTION = float(os.environ.get('TRAIN_FRACTION', 1.0))
@@ -125,6 +131,8 @@ def main():
             "tau": config.tau,
             "ablation_tag": ABLATION_TAG,
             "seed": SEED,
+            "amp": AMP,
+            "grad_accum": GRAD_ACCUM,
             "global_cls": os.environ.get("GLOBAL_CLS", "0") != "0",
             "part_attn": config.PART_ATTN,
             "aug_rotate": float(os.environ.get("AUG_ROTATE", 0)),
@@ -373,14 +381,17 @@ def train(**kwargs):
         # adjust_learning(optimizer, epoch, float_iter)
         # now_lr = optimizer.param_groups[0]['lr']
 
-        optimizer.zero_grad()
+        if i % GRAD_ACCUM == 0:
+            optimizer.zero_grad()
 
         # obtain data for training
         X = X.to(device)
         y = y.to(device)
 
         # raw image
-        y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
+            y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X)
+        y_pred_raw, y_pred_aux, attention_map, h = y_pred_raw.float(), y_pred_aux.float(), attention_map.float(), h.float()
 
         ##################################
         # Attention Cropping
@@ -392,7 +403,9 @@ def train(**kwargs):
         y_aug = torch.cat([y, y], dim=0)
 
         # crop images forward
-        y_pred_aug, y_pred_aux_aug, _, _, _ = net(aug_images)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
+            y_pred_aug, y_pred_aux_aug, _, _, _ = net(aug_images)
+        y_pred_aug, y_pred_aux_aug = y_pred_aug.float(), y_pred_aux_aug.float()
 
         y_pred_aux = torch.cat([y_pred_aux, y_pred_aux_aug], dim=0)
         y_aux = torch.cat([y, y_aug], dim=0)
@@ -410,8 +423,9 @@ def train(**kwargs):
             batch_loss = batch_loss + AUG_CE_WEIGHT * train_ce(y_pred_aug, y_aug)
 
         # backward
-        batch_loss.backward()
-        optimizer.step()
+        (batch_loss / GRAD_ACCUM).backward()
+        if (i + 1) % GRAD_ACCUM == 0 or i + 1 == batch_len:
+            optimizer.step()
 
         # Defensive: release cached-but-unused CUDA memory periodically.
         # AGM+SCLM+ISAB+RCAL combined run right at this GPU's memory
@@ -489,10 +503,14 @@ def validate(**kwargs):
             ##################################
             # Raw Image
             ##################################
-            y_pred_raw, y_pred_aux, _, attention_map, _ = net(X)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
+                y_pred_raw, y_pred_aux, _, attention_map, _ = net(X)
+            y_pred_raw, y_pred_aux, attention_map = y_pred_raw.float(), y_pred_aux.float(), attention_map.float()
 
             crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
+                y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
+            y_pred_crop3, y_pred_aux_crop3 = y_pred_crop3.float(), y_pred_aux_crop3.float()
 
             ##################################
             # Final prediction
