@@ -125,6 +125,7 @@ def main():
             "tau": config.tau,
             "ablation_tag": ABLATION_TAG,
             "seed": SEED,
+            "global_cls": os.environ.get("GLOBAL_CLS", "0") != "0",
             "part_attn": config.PART_ATTN,
             "aug_rotate": float(os.environ.get("AUG_ROTATE", 0)),
             "feat_noise": float(os.environ.get("FEAT_NOISE", 0)),

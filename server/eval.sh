@@ -19,6 +19,6 @@ mkdir -p "$HOME/results"
 COPY="$HOME/runs/eval_${MODEL}_ep$EP.ckpt"; cp "$SRC" "$COPY"
 OUT="$HOME/results/${MODEL}_ep$EP"
 cd "$REPO"
-env CUDA_VISIBLE_DEVICES=$GPU HIP_VISIBLE_DEVICES=$GPU DATA_DIR="$DATA_DIR" BATCH_SIZE=32 INFER_TTA=0 $ARCH \
+env CUDA_VISIBLE_DEVICES=$GPU HIP_VISIBLE_DEVICES=$GPU DATA_DIR="$DATA_DIR" BATCH_SIZE=32 INFER_TTA=0 GLOBAL_CLS=1 $ARCH \
   INFER_CKPT="$COPY" INFER_OUT="$OUT" "$ENV_DIR/bin/python" infer.py | tee "$OUT.log"
 echo ">> Ket qua: $OUT/test_results.json   (predictions.npz de chay mcnemar.py)"

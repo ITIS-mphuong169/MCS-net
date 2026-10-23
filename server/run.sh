@@ -27,7 +27,7 @@ EPOCHS=$([ "$MODEL" = smoke ] && echo 1 || echo "${EPOCHS:-100}")
 mkdir -p "$HOME/runs"
 LOG="$HOME/runs/srv_$MODEL.log"
 CMD="cd '$REPO' && env CUDA_VISIBLE_DEVICES=$GPU HIP_VISIBLE_DEVICES=$GPU DATA_DIR='$DATA_DIR' SAVE_ROOT='$HOME/runs' \
-BATCH_SIZE=$BS WORKERS=${WORKERS:-6} EPOCHS=$EPOCHS SEED=${SEED:-1} AUG_ROTATE=15 FEAT_NOISE=0.1 $ARCH \
+BATCH_SIZE=$BS WORKERS=${WORKERS:-6} EPOCHS=$EPOCHS SEED=${SEED:-1} AUG_ROTATE=15 FEAT_NOISE=0.1 GLOBAL_CLS=1 $ARCH \
 ABLATION_TAG=srv_$MODEL WANDB_ENTITY=phuongmt-b22cn641-h-c-vi-n-c-ng-ngh-b-u-ch-nh-vi-n-th-ng \
 '$ENV_DIR/bin/python' train.py 2>&1 | tee -a '$LOG'"
 

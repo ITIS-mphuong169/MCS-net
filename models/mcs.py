@@ -424,6 +424,14 @@ class WSDAN_MCS(nn.Module):
         self.feat_noise = float(os.environ.get('FEAT_NOISE', 0))
         # FC_DROPOUT=p: dropout on the classifier input; 0 = off
         self.fc_dropout = nn.Dropout(float(os.environ.get('FC_DROPOUT', 0)))
+        # GLOBAL_CLS=1: paper eq. 16 classifies "the final representation jointly
+        # formed by global features and regional features". The global feature is
+        # added as one extra part pooled by BAP with a constant attention map (=
+        # global average pooling of F*, scaled to the mean attention so it sits on
+        # the same scale as the regional parts). Off by default: earlier runs
+        # classified the 32 regional parts only.
+        self.global_cls = os.environ.get('GLOBAL_CLS', '0') != '0'
+        self.M_cls = self.M + 1 if self.global_cls else self.M
         part_dim = 256 if self.part_attn else self.num_features
         self.part_proj = nn.Linear(self.num_features, part_dim) if self.part_attn else None
         # MLA_RANK > 0 swaps standard multi-head attention for latent
@@ -444,7 +452,7 @@ class WSDAN_MCS(nn.Module):
                 num_layers=1,
             )
         # Classification Layer
-        self.fc = nn.Linear(self.M * part_dim, self.num_classes, bias=False)
+        self.fc = nn.Linear(self.M_cls * part_dim, self.num_classes, bias=False)
 
         logging.info(
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
@@ -455,7 +463,7 @@ class WSDAN_MCS(nn.Module):
             # *100: feature_matrix is L2-normalized (tiny values) in BAP; the
             # original WS-DAN code scales it up before this single Linear layer
             return self.fc(self.fc_dropout(feature_matrix * 100.))
-        parts = feature_matrix.view(batch_size, self.M, self.num_features)
+        parts = feature_matrix.view(batch_size, self.M_cls, self.num_features)
         parts = self.part_proj(parts)
         parts = self.part_transformer(parts)
         # no *100 here: the original code scaled the tiny L2-normalized BAP
@@ -463,6 +471,14 @@ class WSDAN_MCS(nn.Module):
         # LayerNorm already renormalizes to unit scale, so the extra *100
         # just overshoots and blew up the loss to NaN in practice
         return self.fc(self.fc_dropout(parts.reshape(batch_size, -1)))
+
+    def _cls_maps(self, attention_maps):
+        """Attention maps used for classification: the M regional maps, plus a
+        constant (global) map when GLOBAL_CLS is on."""
+        if not self.global_cls:
+            return attention_maps
+        g = attention_maps.detach().mean(dim=(1, 2, 3), keepdim=True).expand_as(attention_maps[:, :1])
+        return torch.cat([attention_maps, g], dim=1)
 
     def visualize(self, x):
         batch_size = x.size(0)
@@ -477,7 +493,7 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
-        feature_matrix, _ = self.bap(feature_maps, attention_maps)
+        feature_matrix, _ = self.bap(feature_maps, self._cls_maps(attention_maps))
         p = self._classify(feature_matrix, batch_size)
 
         return p, attention_maps
@@ -492,7 +508,7 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
-        feature_matrix, feature_matrix_hat = self.bap(feature_maps, attention_maps)
+        feature_matrix, feature_matrix_hat = self.bap(feature_maps, self._cls_maps(attention_maps))
 
         # SCLM style embedding (eq. 8-11), for the contrastive loss
         # computed externally in train.py (needs batch labels)
