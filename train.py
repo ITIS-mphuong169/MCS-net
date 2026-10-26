@@ -134,6 +134,8 @@ def main():
             "amp": AMP,
             "grad_accum": GRAD_ACCUM,
             "global_cls": os.environ.get("GLOBAL_CLS", "0") != "0",
+            "part_residual": os.environ.get("PART_RESIDUAL", "0") != "0",
+            "part_pos": os.environ.get("PART_POS", "0") != "0",
             "part_attn": config.PART_ATTN,
             "aug_rotate": float(os.environ.get("AUG_ROTATE", 0)),
             "feat_noise": float(os.environ.get("FEAT_NOISE", 0)),

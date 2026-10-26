@@ -451,6 +451,20 @@ class WSDAN_MCS(nn.Module):
                 ),
                 num_layers=1,
             )
+        # PART_RESIDUAL=1: keep the baseline's direct path next to the relation
+        # module - logits = fc_raw(BAP parts) + fc(relation-module output), i.e. a
+        # linear classifier on [raw parts, related parts]. The module can then
+        # only add to what the paper's classifier already sees.
+        self.part_residual = self.part_attn and os.environ.get('PART_RESIDUAL', '0') != '0'
+        self.fc_raw = nn.Linear(self.M_cls * self.num_features, self.num_classes, bias=False) \
+            if self.part_residual else None
+        # PART_POS=1: tell the relation module where each region is. Each
+        # attention map is turned into a 2-D distribution and summarised by its
+        # centroid (x, y) and spread (std x, std y); a small linear layer embeds
+        # these 4 numbers and adds them to the region's token (composition cue -
+        # the parts are otherwise an unordered set).
+        self.part_pos = self.part_attn and os.environ.get('PART_POS', '0') != '0'
+        self.pos_embed = nn.Linear(4, part_dim) if self.part_pos else None
         # Classification Layer
         self.fc = nn.Linear(self.M_cls * part_dim, self.num_classes, bias=False)
 
@@ -458,19 +472,39 @@ class WSDAN_MCS(nn.Module):
             'WSDAN: using {} as feature extractor, num_classes: {}, num_attentions: {}'.format(net, self.num_classes,
                                                                                                self.M))
 
-    def _classify(self, feature_matrix, batch_size):
+    @staticmethod
+    def _region_geometry(maps):
+        """(B, M, H, W) attention maps -> (B, M, 4): centroid x, y and spread
+        (std) x, y of each map, in [-1, 1] image coordinates."""
+        B, M, H, W = maps.size()
+        w = maps.float().clamp(min=0).flatten(2)
+        w = w / (w.sum(-1, keepdim=True) + EPSILON)
+        ys = torch.linspace(-1, 1, H, device=maps.device).view(H, 1).expand(H, W).reshape(-1)
+        xs = torch.linspace(-1, 1, W, device=maps.device).view(1, W).expand(H, W).reshape(-1)
+        cx, cy = (w * xs).sum(-1), (w * ys).sum(-1)
+        sx = ((w * (xs - cx.unsqueeze(-1)) ** 2).sum(-1) + EPSILON).sqrt()
+        sy = ((w * (ys - cy.unsqueeze(-1)) ** 2).sum(-1) + EPSILON).sqrt()
+        return torch.stack([cx, cy, sx, sy], dim=-1)
+
+    def _classify(self, feature_matrix, batch_size, maps=None):
         if not self.part_attn:
             # *100: feature_matrix is L2-normalized (tiny values) in BAP; the
             # original WS-DAN code scales it up before this single Linear layer
             return self.fc(self.fc_dropout(feature_matrix * 100.))
         parts = feature_matrix.view(batch_size, self.M_cls, self.num_features)
+        raw = parts
         parts = self.part_proj(parts)
+        if self.part_pos:
+            parts = parts + self.pos_embed(self._region_geometry(maps).to(parts.dtype))
         parts = self.part_transformer(parts)
         # no *100 here: the original code scaled the tiny L2-normalized BAP
         # output before its single Linear layer, but part_transformer's
         # LayerNorm already renormalizes to unit scale, so the extra *100
         # just overshoots and blew up the loss to NaN in practice
-        return self.fc(self.fc_dropout(parts.reshape(batch_size, -1)))
+        logits = self.fc(self.fc_dropout(parts.reshape(batch_size, -1)))
+        if self.part_residual:
+            logits = logits + self.fc_raw(self.fc_dropout(raw.reshape(batch_size, -1) * 100.))
+        return logits
 
     def _cls_maps(self, attention_maps):
         """Attention maps used for classification: the M regional maps, plus a
@@ -493,8 +527,9 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
-        feature_matrix, _ = self.bap(feature_maps, self._cls_maps(attention_maps))
-        p = self._classify(feature_matrix, batch_size)
+        cls_maps = self._cls_maps(attention_maps)
+        feature_matrix, _ = self.bap(feature_maps, cls_maps)
+        p = self._classify(feature_matrix, batch_size, cls_maps)
 
         return p, attention_maps
 
@@ -508,14 +543,15 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_maps = feature_maps[:, :self.M, ...]
 
-        feature_matrix, feature_matrix_hat = self.bap(feature_maps, self._cls_maps(attention_maps))
+        cls_maps = self._cls_maps(attention_maps)
+        feature_matrix, feature_matrix_hat = self.bap(feature_maps, cls_maps)
 
         # SCLM style embedding (eq. 8-11), for the contrastive loss
         # computed externally in train.py (needs batch labels)
         h = style_embedding(feature_maps, attention_maps)
 
         # Classification
-        p = self._classify(feature_matrix, batch_size)
+        p = self._classify(feature_matrix, batch_size, cls_maps)
 
         # Generate Attention Map
         if self.training:
@@ -530,7 +566,7 @@ class WSDAN_MCS(nn.Module):
         else:
             attention_map = torch.mean(attention_maps, dim=1, keepdim=True)  # (B, 1, H, W)
 
-        return (p, p - self._classify(feature_matrix_hat, batch_size),
+        return (p, p - self._classify(feature_matrix_hat, batch_size, cls_maps),
                 feature_matrix, attention_map, h)
 
     def load_state_dict(self, state_dict, strict=True):
