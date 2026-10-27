@@ -465,6 +465,17 @@ class WSDAN_MCS(nn.Module):
         # the parts are otherwise an unordered set).
         self.part_pos = self.part_attn and os.environ.get('PART_POS', '0') != '0'
         self.pos_embed = nn.Linear(4, part_dim) if self.part_pos else None
+        # RL_SELECT=1: learn which region to crop (attention cropping, the
+        # augmentation fed back as y_pred_aug / Lcausal) instead of sampling it
+        # in proportion to attention mass. A policy scores each region from its
+        # token after the relation module (detached, so only the policy learns
+        # from the reward); train.py rewards a crop by how much it raises the
+        # log-probability of the true class over the raw image (REINFORCE).
+        # The drop region keeps the original sampling.
+        self.rl_select = self.part_attn and os.environ.get('RL_SELECT', '0') != '0'
+        self.policy = nn.Linear(part_dim, 1) if self.rl_select else None
+        self.rl_logp = self.rl_entropy = None
+        self._tokens = None
         # Classification Layer
         self.fc = nn.Linear(self.M_cls * part_dim, self.num_classes, bias=False)
 
@@ -497,6 +508,7 @@ class WSDAN_MCS(nn.Module):
         if self.part_pos:
             parts = parts + self.pos_embed(self._region_geometry(maps).to(parts.dtype))
         parts = self.part_transformer(parts)
+        self._tokens = parts
         # no *100 here: the original code scaled the tiny L2-normalized BAP
         # output before its single Linear layer, but part_transformer's
         # LayerNorm already renormalizes to unit scale, so the extra *100
@@ -552,6 +564,7 @@ class WSDAN_MCS(nn.Module):
 
         # Classification
         p = self._classify(feature_matrix, batch_size, cls_maps)
+        self.factual_tokens = self._tokens  # the counterfactual _classify call below overwrites _tokens
 
         # Generate Attention Map
         if self.training:
@@ -563,6 +576,14 @@ class WSDAN_MCS(nn.Module):
                 k_index = np.random.choice(self.M, 2, p=attention_weights.cpu().numpy())
                 attention_map.append(attention_maps[i, k_index, ...])
             attention_map = torch.stack(attention_map)  # (B, 2, H, W) - one for cropping, the other for dropping
+            if self.rl_select:
+                # region tokens of the factual pass (first M = the regional parts)
+                scores = self.policy(self.factual_tokens[:, :self.M].detach().float()).squeeze(-1)
+                dist = torch.distributions.Categorical(logits=scores)
+                crop_idx = dist.sample()
+                self.rl_logp, self.rl_entropy = dist.log_prob(crop_idx), dist.entropy()
+                crop_map = attention_maps[torch.arange(batch_size, device=attention_maps.device), crop_idx]
+                attention_map = torch.cat([crop_map.unsqueeze(1), attention_map[:, 1:]], dim=1)
         else:
             attention_map = torch.mean(attention_maps, dim=1, keepdim=True)  # (B, 1, H, W)
 

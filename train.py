@@ -79,6 +79,13 @@ SEED = int(os.environ.get('SEED', 1231))
 #                   is BATCH_SIZE * N (e.g. 16 x 2 = the paper's 32)
 AMP = os.environ.get('AMP', '0') != '0'
 GRAD_ACCUM = max(1, int(os.environ.get('GRAD_ACCUM', 1)))
+# RL_SELECT=1 (model side, see WSDAN_MCS.policy): REINFORCE on the crop-region
+# policy. Reward = log p(true class | crop) - log p(true class | raw image),
+# minus a moving-average baseline; RL_WEIGHT scales the policy loss and
+# RL_ENTROPY adds an entropy bonus so the policy keeps exploring regions.
+RL_WEIGHT = float(os.environ.get('RL_WEIGHT', 1.0))
+RL_ENTROPY = float(os.environ.get('RL_ENTROPY', 0.01))
+rl_baseline = None
 # WEIGHT_DECAY: SGD weight decay (paper Table 2: 1e-5)
 WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', 1e-5))
 TRAIN_FRACTION = float(os.environ.get('TRAIN_FRACTION', 1.0))
@@ -131,6 +138,8 @@ def main():
             "tau": config.tau,
             "ablation_tag": ABLATION_TAG,
             "seed": SEED,
+            "rl_select": os.environ.get("RL_SELECT", "0") != "0",
+            "rl_weight": RL_WEIGHT,
             "amp": AMP,
             "grad_accum": GRAD_ACCUM,
             "global_cls": os.environ.get("GLOBAL_CLS", "0") != "0",
@@ -394,6 +403,9 @@ def train(**kwargs):
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
             y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X)
         y_pred_raw, y_pred_aux, attention_map, h = y_pred_raw.float(), y_pred_aux.float(), attention_map.float(), h.float()
+        # crop-policy outputs of this (raw-image) pass; the aug-image pass below overwrites them
+        model = getattr(net, 'module', net)
+        rl_logp, rl_entropy = getattr(model, 'rl_logp', None), getattr(model, 'rl_entropy', None)
 
         ##################################
         # Attention Cropping
@@ -421,6 +433,17 @@ def train(**kwargs):
         Lcausal = train_ce(y_pred_aux, y_aux)
         Lcon = contrastive_loss(h, y)
         batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda1 * Lcon
+        rl_reward = None
+        if getattr(model, 'rl_select', False) and rl_logp is not None:
+            global rl_baseline
+            B = y.size(0)
+            with torch.no_grad():
+                lp_crop = F.log_softmax(y_pred_aug[:B], dim=1).gather(1, y[:, None]).squeeze(1)
+                lp_raw = F.log_softmax(y_pred_raw, dim=1).gather(1, y[:, None]).squeeze(1)
+                rl_reward = lp_crop - lp_raw
+                rl_baseline = rl_reward.mean() if rl_baseline is None else 0.9 * rl_baseline + 0.1 * rl_reward.mean()
+            Lrl = -((rl_reward - rl_baseline) * rl_logp).mean() - RL_ENTROPY * rl_entropy.mean()
+            batch_loss = batch_loss + RL_WEIGHT * Lrl
         if AUG_CE_WEIGHT:
             batch_loss = batch_loss + AUG_CE_WEIGHT * train_ce(y_pred_aug, y_aug)
 
@@ -459,6 +482,8 @@ def train(**kwargs):
                 wandb.log({
                     'batch/loss': batch_loss.item(),
                     'batch/raw_top1': epoch_raw_acc[0],
+                    **({'rl/reward': rl_reward.mean().item(), 'rl/entropy': rl_entropy.mean().item()}
+                       if rl_reward is not None else {}),
                     'epoch': epoch + 1,
                 }, step=global_step)
             except Exception as e:
