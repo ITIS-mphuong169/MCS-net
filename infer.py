@@ -31,6 +31,10 @@ torch.backends.cudnn.benchmark = True
 DATA_DIR = config.DATA_DIR
 # INFER_TTA=0 skips the 7 extra TTA forward passes (~8x faster, center crop only)
 USE_TTA = os.environ.get('INFER_TTA', '1') != '0'
+# 'two_view': raw logits averaged with one attention crop (theta 0.5, the
+# middle of training's crop range). The crop map is the model's eval-time
+# attention_map - mean of all maps, or the RL policy's region (RL_EVAL).
+USE_TWO_VIEW = os.environ.get('INFER_TWO_VIEW', '1') != '0'
 
 
 def main():
@@ -72,7 +76,11 @@ def evaluate(data_loader, net, class_names):
     """One pass, two protocols: 'center_crop' (single center-cropped view,
     as the paper's sec. 3.3 describes) and 'tta' (the original author code's
     flip + 3 attention-crop averaging)."""
-    preds = {'center_crop': [], 'tta': []} if USE_TTA else {'center_crop': []}
+    preds = {'center_crop': []}
+    if USE_TWO_VIEW:
+        preds['two_view'] = []
+    if USE_TTA:
+        preds['tta'] = []
     top5 = {k: TopKAccuracyMetric(topk=(1, 5)) for k in preds}
     all_labels = []
 
@@ -87,6 +95,9 @@ def evaluate(data_loader, net, class_names):
             # model returns (p, p_effect, feature_matrix, attention_map, h)
             y_pred_raw, _, _, attention_map, _ = net(X)
             outputs = {'center_crop': y_pred_raw}
+            if USE_TWO_VIEW:
+                y_pred_crop = net(batch_augment(X, attention_map, mode='crop', theta=0.5, padding_ratio=0.1))[0]
+                outputs['two_view'] = (y_pred_raw + y_pred_crop) / 2.
 
             if USE_TTA:
                 y_pred_raw_m, _, _, attention_map_m, _ = net(X_m)

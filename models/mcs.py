@@ -471,8 +471,12 @@ class WSDAN_MCS(nn.Module):
         # token after the relation module (detached, so only the policy learns
         # from the reward); train.py rewards a crop by how much it raises the
         # log-probability of the true class over the raw image (REINFORCE).
-        # The drop region keeps the original sampling.
+        # The drop region keeps the original sampling. At test time the crop
+        # map comes from RL_EVAL: 'policy' (argmax region, default), 'mean'
+        # (mean of all maps, as WS-DAN/MCS-Net) or 'sample' (attention-weighted
+        # random region) - the latter two are ablations on the same checkpoint.
         self.rl_select = self.part_attn and os.environ.get('RL_SELECT', '0') != '0'
+        self.rl_eval = os.environ.get('RL_EVAL', 'policy')
         self.policy = nn.Linear(part_dim, 1) if self.rl_select else None
         self.rl_logp = self.rl_entropy = None
         self._tokens = None
@@ -586,6 +590,13 @@ class WSDAN_MCS(nn.Module):
                 attention_map = torch.cat([crop_map.unsqueeze(1), attention_map[:, 1:]], dim=1)
         else:
             attention_map = torch.mean(attention_maps, dim=1, keepdim=True)  # (B, 1, H, W)
+            if self.rl_select and self.rl_eval != 'mean':
+                if self.rl_eval == 'policy':
+                    crop_idx = self.policy(self.factual_tokens[:, :self.M].float()).squeeze(-1).argmax(1)
+                else:
+                    mass = torch.sqrt(attention_maps.sum(dim=(2, 3)).float() + EPSILON)
+                    crop_idx = torch.multinomial(mass, 1).squeeze(1)
+                attention_map = attention_maps[torch.arange(batch_size, device=attention_maps.device), crop_idx].unsqueeze(1)
 
         return (p, p - self._classify(feature_matrix_hat, batch_size, cls_maps),
                 feature_matrix, attention_map, h)

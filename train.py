@@ -83,8 +83,13 @@ GRAD_ACCUM = max(1, int(os.environ.get('GRAD_ACCUM', 1)))
 # policy. Reward = log p(true class | crop) - log p(true class | raw image),
 # minus a moving-average baseline; RL_WEIGHT scales the policy loss and
 # RL_ENTROPY adds an entropy bonus so the policy keeps exploring regions.
+# The crop is also used at test time (infer.py 'two_view': raw + crop logits
+# averaged), so the reward is measured on that fused prediction. The policy
+# gets its own learning rate, RL_LR_MULT x the backbone lr (at the shared
+# 1e-3 it stayed almost uniform over the 32 regions).
 RL_WEIGHT = float(os.environ.get('RL_WEIGHT', 1.0))
 RL_ENTROPY = float(os.environ.get('RL_ENTROPY', 0.01))
+RL_LR_MULT = float(os.environ.get('RL_LR_MULT', 10))
 rl_baseline = None
 # WEIGHT_DECAY: SGD weight decay (paper Table 2: 1e-5)
 WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', 1e-5))
@@ -140,6 +145,7 @@ def main():
             "seed": SEED,
             "rl_select": os.environ.get("RL_SELECT", "0") != "0",
             "rl_weight": RL_WEIGHT,
+            "rl_lr_mult": RL_LR_MULT,
             "amp": AMP,
             "grad_accum": GRAD_ACCUM,
             "global_cls": os.environ.get("GLOBAL_CLS", "0") != "0",
@@ -252,7 +258,14 @@ def main():
     # Optimizer
     learning_rate = config.learning_rate
     # print('begin with ', learning_rate, ' learning rate')
-    optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=WEIGHT_DECAY)
+    policy = getattr(getattr(net, 'module', net), 'policy', None)
+    if policy is not None:
+        policy_ids = {id(p) for p in policy.parameters()}
+        params = [{'params': [p for p in net.parameters() if id(p) not in policy_ids]},
+                  {'params': list(policy.parameters()), 'lr': learning_rate * RL_LR_MULT}]
+    else:
+        params = net.parameters()
+    optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
 
     # Restore optimizer/scheduler state on resume (momentum buffers, LR
@@ -438,9 +451,9 @@ def train(**kwargs):
             global rl_baseline
             B = y.size(0)
             with torch.no_grad():
-                lp_crop = F.log_softmax(y_pred_aug[:B], dim=1).gather(1, y[:, None]).squeeze(1)
+                lp_fused = F.log_softmax((y_pred_raw + y_pred_aug[:B]) / 2, dim=1).gather(1, y[:, None]).squeeze(1)
                 lp_raw = F.log_softmax(y_pred_raw, dim=1).gather(1, y[:, None]).squeeze(1)
-                rl_reward = lp_crop - lp_raw
+                rl_reward = lp_fused - lp_raw
                 rl_baseline = rl_reward.mean() if rl_baseline is None else 0.9 * rl_baseline + 0.1 * rl_reward.mean()
             Lrl = -((rl_reward - rl_baseline) * rl_logp).mean() - RL_ENTROPY * rl_entropy.mean()
             batch_loss = batch_loss + RL_WEIGHT * Lrl
