@@ -74,11 +74,30 @@ ABLATION_TAG = os.environ.get('ABLATION_TAG', '')
 # keeps its own fixed seed (data_loader.py), so every seed sees the same images
 SEED = int(os.environ.get('SEED', 1231))
 # Memory savers for small GPUs (both off by default):
-#   AMP=1         - bfloat16 autocast for forward passes (losses stay float32)
+#   AMP=1         - autocast for forward passes (losses stay float32)
+#   AMP_DTYPE     - bf16 (default; Ampere+) or fp16 (Turing/T4: bf16 has no
+#                   tensor-core support there; fp16 adds a GradScaler)
 #   GRAD_ACCUM=N  - step the optimizer every N batches, so the effective batch
 #                   is BATCH_SIZE * N (e.g. 16 x 2 = the paper's 32)
 AMP = os.environ.get('AMP', '0') != '0'
+AMP_DTYPE = torch.float16 if os.environ.get('AMP_DTYPE', 'bf16') == 'fp16' else torch.bfloat16
+scaler = torch.amp.GradScaler('cuda', enabled=AMP and AMP_DTYPE == torch.float16)
 GRAD_ACCUM = max(1, int(os.environ.get('GRAD_ACCUM', 1)))
+# PLAIN_CLS=1 (model side, see WSDAN_MCS.forward_plain): backbone + linear
+# classifier only. One forward pass per step, CE loss only: no attention
+# crop/drop, no CCAM, no SCLM. The reference point for a new backbone.
+PLAIN = os.environ.get('PLAIN_CLS', '0') != '0'
+# Fine-tuning a pretrained transformer backbone (OPTIM=adamw):
+#   OPTIM             sgd (paper: momentum 0.9) or adamw
+#   BACKBONE_LR_MULT  lr multiplier for the backbone parameters (net.features);
+#                     the heads keep config.learning_rate. A pretrained CLIP
+#                     tower is destroyed by the head's lr, hence e.g. 0.01
+#   SCHED             step (paper: x0.9 every 2 epochs) or cosine (per
+#                     iteration, with WARMUP_EPOCHS of linear warm-up)
+OPTIM = os.environ.get('OPTIM', 'sgd')
+BACKBONE_LR_MULT = float(os.environ.get('BACKBONE_LR_MULT', 1.0))
+SCHED = os.environ.get('SCHED', 'step')
+WARMUP_EPOCHS = float(os.environ.get('WARMUP_EPOCHS', 1.0))
 # RL_SELECT=1 (model side, see WSDAN_MCS.policy): REINFORCE on the crop-region
 # policy. Reward = log p(true class | crop) - log p(true class | raw image),
 # minus a moving-average baseline; RL_WEIGHT scales the policy loss and
@@ -127,16 +146,23 @@ def main():
     # Fixed run id + resume="allow" so re-running this script in a later
     # Kaggle session (to continue from a checkpoint) appends to the same
     # W&B run instead of starting a new one.
+    net_id = config.net.replace('.', '-')  # timm names carry a '.tag'; W&B ids can't
     wandb.init(
         project="mcs-net-wikiart",
-        id="{}-{}-abl-{}".format(config.tag, config.net, ABLATION_TAG) if ABLATION_TAG
-        else "{}-{}-v2".format(config.tag, config.net),
+        id="{}-{}-abl-{}".format(config.tag, net_id, ABLATION_TAG) if ABLATION_TAG
+        else "{}-{}-v2".format(config.tag, net_id),
         resume="allow",
         config={
             "epochs": config.epochs,
             "batch_size": config.batch_size,
             "learning_rate": config.learning_rate,
             "net": config.net,
+            "plain_cls": PLAIN,
+            "optim": OPTIM,
+            "backbone_lr_mult": BACKBONE_LR_MULT,
+            "sched": SCHED,
+            "warmup_epochs": WARMUP_EPOCHS if SCHED == 'cosine' else None,
+            "amp_dtype": 'fp16' if AMP_DTYPE == torch.float16 else 'bf16',
             "num_attentions": config.num_attentions,
             "lambda1": config.lambda1,
             "lambda2": config.lambda2,
@@ -258,15 +284,29 @@ def main():
     # Optimizer
     learning_rate = config.learning_rate
     # print('begin with ', learning_rate, ' learning rate')
-    policy = getattr(getattr(net, 'module', net), 'policy', None)
+    model = getattr(net, 'module', net)
+    policy = getattr(model, 'policy', None)
+    policy_ids = {id(p) for p in policy.parameters()} if policy is not None else set()
+    backbone_ids = {id(p) for p in model.features.parameters()} if BACKBONE_LR_MULT != 1.0 else set()
+    params = [{'params': [p for p in net.parameters() if id(p) not in policy_ids | backbone_ids]}]
+    if backbone_ids:
+        params.append({'params': list(model.features.parameters()), 'lr': learning_rate * BACKBONE_LR_MULT})
     if policy is not None:
-        policy_ids = {id(p) for p in policy.parameters()}
-        params = [{'params': [p for p in net.parameters() if id(p) not in policy_ids]},
-                  {'params': list(policy.parameters()), 'lr': learning_rate * RL_LR_MULT}]
+        params.append({'params': list(policy.parameters()), 'lr': learning_rate * RL_LR_MULT})
+    if OPTIM == 'adamw':
+        optimizer = torch.optim.AdamW(params, lr=learning_rate, weight_decay=WEIGHT_DECAY)
     else:
-        params = net.parameters()
-    optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
+        optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=WEIGHT_DECAY)
+    if SCHED == 'cosine':
+        # stepped once per optimizer step (train()), not per epoch
+        total = config.epochs * len(train_loader) // GRAD_ACCUM
+        warmup = int(WARMUP_EPOCHS * len(train_loader) // GRAD_ACCUM)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: (s + 1) / warmup if s < warmup
+                                                      else 0.5 * (1 + math.cos(math.pi * (s - warmup) / max(1, total - warmup))))
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
+    print('optimizer {} lr {:g} (backbone x{:g}), schedule {}, weight decay {:g}, plain {}'.format(
+        OPTIM, learning_rate, BACKBONE_LR_MULT, SCHED, WEIGHT_DECAY, PLAIN))
 
     # Restore optimizer/scheduler state on resume (momentum buffers, LR
     # decay progress) - checkpoints from before this fix won't have these
@@ -277,6 +317,8 @@ def main():
             optimizer.load_state_dict(checkpoint['optimizer_state'])
         if 'scheduler_state' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state'])
+        if 'scaler_state' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state'])
 
     # Model checkpoint
     callback_monitor = 'val_{}'.format(raw_metric.name)
@@ -320,6 +362,7 @@ def main():
               data_loader=train_loader,
               net=net,
               optimizer=optimizer,
+              scheduler=scheduler,
               pbar=pbar)
 
         validate(logs=logs,
@@ -350,7 +393,7 @@ def main():
 
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(logs['val_loss'])
-        else:
+        elif SCHED != 'cosine':
             scheduler.step()
         callback.on_epoch_end(logs, net, optimizer=optimizer, scheduler=scheduler)
 
@@ -362,6 +405,7 @@ def main():
             'state_dict': {k: v.cpu() for k, v in state_dict.items()},
             'optimizer_state': optimizer.state_dict(),
             'scheduler_state': scheduler.state_dict(),
+            'scaler_state': scaler.state_dict(),
             'best_score': callback.best_score,
             'best_acc': best_acc,
         }, last_ckpt)
@@ -387,6 +431,7 @@ def train(**kwargs):
     data_loader = kwargs['data_loader']
     net = kwargs['net']
     optimizer = kwargs['optimizer']
+    scheduler = kwargs['scheduler']
     pbar = kwargs['pbar']
 
     # metrics initialization
@@ -413,57 +458,66 @@ def train(**kwargs):
         y = y.to(device)
 
         # raw image
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
+        with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
             y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X)
         y_pred_raw, y_pred_aux, attention_map, h = y_pred_raw.float(), y_pred_aux.float(), attention_map.float(), h.float()
         # crop-policy outputs of this (raw-image) pass; the aug-image pass below overwrites them
         model = getattr(net, 'module', net)
         rl_logp, rl_entropy = getattr(model, 'rl_logp', None), getattr(model, 'rl_entropy', None)
-
-        ##################################
-        # Attention Cropping
-        ##################################
-        with torch.no_grad():
-            crop_images = batch_augment(X, attention_map[:, :1, :, :], mode='crop', theta=(0.4, 0.6), padding_ratio=0.1)
-            drop_images = batch_augment(X, attention_map[:, 1:, :, :], mode='drop', theta=(0.2, 0.5))
-        aug_images = torch.cat([crop_images, drop_images], dim=0)
-        y_aug = torch.cat([y, y], dim=0)
-
-        # crop images forward
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
-            y_pred_aug, y_pred_aux_aug, _, _, _ = net(aug_images)
-        y_pred_aug, y_pred_aux_aug = y_pred_aug.float(), y_pred_aux_aug.float()
-
-        y_pred_aux = torch.cat([y_pred_aux, y_pred_aux_aug], dim=0)
-        y_aux = torch.cat([y, y_aug], dim=0)
-
-        # loss - matches the paper's eq. 17 structure (L = Lcls + l1*Lcon +
-        # l2*Lcausal). RCAL (the relation-counterfactual extension
-        # previously added as a 4th term here) is dropped - confirmed on
-        # Kaggle to hurt accuracy regardless of which other modules were
-        # present, in a dedicated A/B comparison.
-        Lcls = train_ce(y_pred_raw, y)
-        Lcausal = train_ce(y_pred_aux, y_aux)
-        Lcon = contrastive_loss(h, y)
-        batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda1 * Lcon
         rl_reward = None
-        if getattr(model, 'rl_select', False) and rl_logp is not None:
-            global rl_baseline
-            B = y.size(0)
-            with torch.no_grad():
-                lp_fused = F.log_softmax((y_pred_raw + y_pred_aug[:B]) / 2, dim=1).gather(1, y[:, None]).squeeze(1)
-                lp_raw = F.log_softmax(y_pred_raw, dim=1).gather(1, y[:, None]).squeeze(1)
-                rl_reward = lp_fused - lp_raw
-                rl_baseline = rl_reward.mean() if rl_baseline is None else 0.9 * rl_baseline + 0.1 * rl_reward.mean()
-            Lrl = -((rl_reward - rl_baseline) * rl_logp).mean() - RL_ENTROPY * rl_entropy.mean()
-            batch_loss = batch_loss + RL_WEIGHT * Lrl
-        if AUG_CE_WEIGHT:
-            batch_loss = batch_loss + AUG_CE_WEIGHT * train_ce(y_pred_aug, y_aug)
 
-        # backward
-        (batch_loss / GRAD_ACCUM).backward()
+        if PLAIN:
+            # plain classifier: CE on the raw image only (the crop/drop/aux
+            # metrics below just mirror the raw prediction)
+            batch_loss = train_ce(y_pred_raw, y)
+            y_pred_aug, y_aug, y_pred_aux, y_aux = y_pred_raw, y, y_pred_raw, y
+        else:
+            ##################################
+            # Attention Cropping
+            ##################################
+            with torch.no_grad():
+                crop_images = batch_augment(X, attention_map[:, :1, :, :], mode='crop', theta=(0.4, 0.6), padding_ratio=0.1)
+                drop_images = batch_augment(X, attention_map[:, 1:, :, :], mode='drop', theta=(0.2, 0.5))
+            aug_images = torch.cat([crop_images, drop_images], dim=0)
+            y_aug = torch.cat([y, y], dim=0)
+
+            # crop images forward
+            with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
+                y_pred_aug, y_pred_aux_aug, _, _, _ = net(aug_images)
+            y_pred_aug, y_pred_aux_aug = y_pred_aug.float(), y_pred_aux_aug.float()
+
+            y_pred_aux = torch.cat([y_pred_aux, y_pred_aux_aug], dim=0)
+            y_aux = torch.cat([y, y_aug], dim=0)
+
+            # loss - matches the paper's eq. 17 structure (L = Lcls + l1*Lcon +
+            # l2*Lcausal). RCAL (the relation-counterfactual extension
+            # previously added as a 4th term here) is dropped - confirmed on
+            # Kaggle to hurt accuracy regardless of which other modules were
+            # present, in a dedicated A/B comparison.
+            Lcls = train_ce(y_pred_raw, y)
+            Lcausal = train_ce(y_pred_aux, y_aux)
+            Lcon = contrastive_loss(h, y)
+            batch_loss = Lcls + config.lambda2 * Lcausal + config.lambda1 * Lcon
+            if getattr(model, 'rl_select', False) and rl_logp is not None:
+                global rl_baseline
+                B = y.size(0)
+                with torch.no_grad():
+                    lp_fused = F.log_softmax((y_pred_raw + y_pred_aug[:B]) / 2, dim=1).gather(1, y[:, None]).squeeze(1)
+                    lp_raw = F.log_softmax(y_pred_raw, dim=1).gather(1, y[:, None]).squeeze(1)
+                    rl_reward = lp_fused - lp_raw
+                    rl_baseline = rl_reward.mean() if rl_baseline is None else 0.9 * rl_baseline + 0.1 * rl_reward.mean()
+                Lrl = -((rl_reward - rl_baseline) * rl_logp).mean() - RL_ENTROPY * rl_entropy.mean()
+                batch_loss = batch_loss + RL_WEIGHT * Lrl
+            if AUG_CE_WEIGHT:
+                batch_loss = batch_loss + AUG_CE_WEIGHT * train_ce(y_pred_aug, y_aug)
+
+        # backward (scaler is a no-op unless AMP_DTYPE=fp16)
+        scaler.scale(batch_loss / GRAD_ACCUM).backward()
         if (i + 1) % GRAD_ACCUM == 0 or i + 1 == batch_len:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
+            if SCHED == 'cosine':
+                scheduler.step()
 
         # Defensive: release cached-but-unused CUDA memory periodically.
         # AGM+SCLM+ISAB+RCAL combined run right at this GPU's memory
@@ -543,20 +597,23 @@ def validate(**kwargs):
             ##################################
             # Raw Image
             ##################################
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
+            with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
                 y_pred_raw, y_pred_aux, _, attention_map, _ = net(X)
             y_pred_raw, y_pred_aux, attention_map = y_pred_raw.float(), y_pred_aux.float(), attention_map.float()
 
-            crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP):
-                y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
-            y_pred_crop3, y_pred_aux_crop3 = y_pred_crop3.float(), y_pred_aux_crop3.float()
+            if PLAIN:
+                y_pred = y_pred_raw
+            else:
+                crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
+                with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
+                    y_pred_crop3, y_pred_aux_crop3, _, _, _ = net(crop_images3)
+                y_pred_crop3, y_pred_aux_crop3 = y_pred_crop3.float(), y_pred_aux_crop3.float()
 
-            ##################################
-            # Final prediction
-            ##################################
-            y_pred = (y_pred_raw + y_pred_crop3) / 2.
-            y_pred_aux = (y_pred_aux + y_pred_aux_crop3) / 2.
+                ##################################
+                # Final prediction
+                ##################################
+                y_pred = (y_pred_raw + y_pred_crop3) / 2.
+                y_pred_aux = (y_pred_aux + y_pred_aux_crop3) / 2.
 
             # loss
             batch_loss = cross_entropy_loss(y_pred, y)

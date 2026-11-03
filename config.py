@@ -20,7 +20,10 @@ learning_rate = 1e-3  # initial learning rate
 # Model Config
 ##################################################
 image_size = (224, 224)  # size of training images
-net = 'resnet101'  # inception_mixed_6e
+# NET: backbone. 'resnet101' (the paper) or a timm name, e.g.
+# 'vit_base_patch16_clip_224.openai' (CLIP image tower: the strongest frozen
+# backbone in the linear probe, probe.py) or 'convnext_base.fb_in22k_ft_in1k'
+net = os.environ.get('NET', 'resnet101')  # inception_mixed_6e
 num_attentions = 32  # number of attention maps
 # loss weights matching the paper's eq. 17 (L = Lcls + lambda1*Lcon +
 # lambda2*Lcausal), Table 2 values

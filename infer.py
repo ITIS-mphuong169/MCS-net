@@ -57,6 +57,11 @@ def main():
     ckpt_epoch = checkpoint.get('logs', {}).get('epoch')
     print('Network loaded from {} @ epoch {}'.format(ckpt, ckpt_epoch))
 
+    if getattr(net, 'plain', False):
+        # no attention maps: every crop would be the whole image again
+        global USE_TTA, USE_TWO_VIEW
+        USE_TTA = USE_TWO_VIEW = False
+
     net.to(device)
     if torch.cuda.device_count() > 1:
         net = nn.DataParallel(net)

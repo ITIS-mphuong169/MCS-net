@@ -275,6 +275,40 @@ class TransformerFeatures(nn.Module):
 
 
 
+class ViTFeatures(nn.Module):
+    """A timm Vision Transformer as a (B, C, H, W) feature-map backbone: the
+    patch tokens after the final LayerNorm, laid back out on the patch grid
+    (14x14 for patch 16 at 224). The CLS token is kept in self.pooled (the
+    image embedding CLIP was trained with; what probe.py scored).
+
+    The data loader normalises with ImageNet statistics; CLIP models were
+    trained with their own, so the input is re-normalised here (a fixed
+    affine map) rather than by changing data_loader.py for every run."""
+
+    def __init__(self, backbone):
+        super(ViTFeatures, self).__init__()
+        import timm
+        self.backbone = backbone
+        self.num_features = backbone.num_features
+        self.num_prefix_tokens = getattr(backbone, 'num_prefix_tokens', 1)
+        cfg = timm.data.resolve_data_config({}, model=backbone)
+        imagenet_mean, imagenet_std = torch.tensor([0.485, 0.456, 0.406]), torch.tensor([0.229, 0.224, 0.225])
+        mean, std = torch.tensor(cfg['mean']), torch.tensor(cfg['std'])
+        # x_model = (x_img - mean) / std with x_img = x * imagenet_std + imagenet_mean
+        self.register_buffer('scale', (imagenet_std / std).view(1, 3, 1, 1))
+        self.register_buffer('shift', ((imagenet_mean - mean) / std).view(1, 3, 1, 1))
+        self.pooled = None
+
+    def forward(self, x):
+        tokens = self.backbone.forward_features(x * self.scale + self.shift)  # (B, 1 + N, C)
+        self.pooled = tokens[:, 0]
+        patches = tokens[:, self.num_prefix_tokens:]
+        B, N, C = patches.size()
+        H = W = int(round(N ** 0.5))
+        assert H * W == N, 'non-square patch grid: %d tokens' % N
+        return patches.transpose(1, 2).reshape(B, C, H, W)
+
+
 class LatentAttentionEncoderLayer(nn.Module):
     """Drop-in replacement for nn.TransformerEncoderLayer (post-norm, ReLU,
     batch_first) whose keys and values go through a shared low-rank latent,
@@ -386,7 +420,13 @@ class WSDAN_MCS(nn.Module):
             print('==> Using MANet with resnet101 backbone')
             self.features = MANet()
             self.num_features = 2048
-        elif 'swin' in net or 'convnext' in net or 'vit' in net:
+        elif 'vit' in net:
+            import timm
+            backbone = timm.create_model(net, pretrained=pretrained, num_classes=0)
+            self.features = ViTFeatures(backbone)
+            self.num_features = self.features.num_features
+            print('==> using timm ViT backbone: %s, num_features=%d' % (net, self.num_features))
+        elif 'swin' in net or 'convnext' in net:
             import timm
             backbone = timm.create_model(net, pretrained=pretrained, features_only=True)
             num_features = backbone.feature_info.channels()[-1]
@@ -395,6 +435,20 @@ class WSDAN_MCS(nn.Module):
             print('==> using timm backbone: %s, num_features=%d' % (net, num_features))
         else:
             raise ValueError('Unsupported net: %s' % net)
+
+        # PLAIN_CLS=1: no MCS-Net at all - backbone + one linear classifier on
+        # the pooled feature (ViT: CLS token, conv nets: global average pool).
+        # The reference point a new backbone is judged against: whatever the
+        # attention / relation modules add must show up over this number.
+        self.plain = os.environ.get('PLAIN_CLS', '0') != '0'
+        self.fc_dropout = nn.Dropout(float(os.environ.get('FC_DROPOUT', 0)))
+        if self.plain:
+            self.fc = nn.Linear(self.num_features, self.num_classes)
+            self.part_attn = self.rl_select = False
+            self.mla_rank = 0
+            self.policy = None
+            logging.info('plain classifier on {}: {} features'.format(net, self.num_features))
+            return
 
         # Attention Generation Module (AGM): channel+spatial correlation
         # refinement of the backbone feature before generating attention
@@ -422,8 +476,7 @@ class WSDAN_MCS(nn.Module):
         # FEAT_NOISE=g: BSFEM-style feature perturbation (paper eq. 2, gamma=0.1),
         # F~ = F + g * std(F) * N(0,1), training only; 0 = off
         self.feat_noise = float(os.environ.get('FEAT_NOISE', 0))
-        # FC_DROPOUT=p: dropout on the classifier input; 0 = off
-        self.fc_dropout = nn.Dropout(float(os.environ.get('FC_DROPOUT', 0)))
+        # FC_DROPOUT=p (set above): dropout on the classifier input; 0 = off
         # GLOBAL_CLS=1: paper eq. 16 classifies "the final representation jointly
         # formed by global features and regional features". The global feature is
         # added as one extra part pooled by BAP with a constant attention map (=
@@ -530,8 +583,26 @@ class WSDAN_MCS(nn.Module):
         g = attention_maps.detach().mean(dim=(1, 2, 3), keepdim=True).expand_as(attention_maps[:, :1])
         return torch.cat([attention_maps, g], dim=1)
 
+    def _pooled(self, feature_maps):
+        pooled = getattr(self.features, 'pooled', None)
+        return pooled if pooled is not None else feature_maps.mean(dim=(2, 3))
+
+    def forward_plain(self, x):
+        """Same 5-tuple as forward() so train.py / infer.py need no special
+        case: the counterfactual logits are zero (no CCAM), the 'attention
+        map' is uniform (a crop of it is the whole image), h is the
+        normalised pooled feature (SCLM weight must be 0 for a plain run)."""
+        feature_maps = self.features(x)
+        pooled = self._pooled(feature_maps)
+        p = self.fc(self.fc_dropout(pooled))
+        attention_map = torch.ones_like(feature_maps[:, :1])
+        return p, torch.zeros_like(p), pooled, attention_map, F.normalize(pooled.float(), dim=-1)
+
     def visualize(self, x):
         batch_size = x.size(0)
+        if self.plain:
+            p, _, _, attention_map, _ = self.forward_plain(x)
+            return p, attention_map
 
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
@@ -551,6 +622,8 @@ class WSDAN_MCS(nn.Module):
 
     def forward(self, x):
         batch_size = x.size(0)
+        if self.plain:
+            return self.forward_plain(x)
 
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
