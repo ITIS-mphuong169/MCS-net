@@ -140,20 +140,10 @@ Image.MAX_IMAGE_PIXELS = 1000000000  # 允许最多 10 亿像素（足够处理�
 import warnings
 warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
 
-def get_data_loaders(data_dir, batch_size=32, num_workers=4, val_split=0.1, test_split=0.1, seed=1231):
-    """
-    加载扁平结构的数据集（如 Kaggle 上的 steubk/wikiart）:
-        data_dir/
-            <class_1>/
-            <class_2>/
-            ...
-
-    每个类别一个文件夹，没有现成的 train/val/test 划分，
-    因此按 seed 固定的随机划分自动切出 val_split / test_split，剩余作为 train。
-    """
-
+def get_transforms():
+    """train / val / test transforms (also used by data_multi.py)."""
     # 💡 增强 transform：确保即使原图极大，在 Resize/Crop 阶段也会被缩小
-    data_transforms = {
+    return {
         'train': transforms.Compose([
             transforms.RandomResizedCrop(224),   # ⚠️ 这一步会主动缩放和裁剪，是关键防护！
             transforms.RandomHorizontalFlip(),
@@ -178,18 +168,33 @@ def get_data_loaders(data_dir, batch_size=32, num_workers=4, val_split=0.1, test
         ]),
     }
 
-    # 自定义安全图像加载器（进一步防御）
-    def safe_pil_loader(path):
-        try:
-            img = Image.open(path)
-            # 如果图片太大，先缩略图再返回（防止内存爆炸）
-            if max(img.size) > 1024:
-                img.thumbnail((1024, 1024))  # 最大边不超过 1024
-            return img.convert('RGB')
-        except Exception as e:
-            print(f"[ERROR] Unable to load image {path}: {e}")
-            # 返回空白图像占位符（避免整个训练中断）
-            return Image.new('RGB', (224, 224))
+
+# 自定义安全图像加载器（进一步防御）
+def safe_pil_loader(path):
+    try:
+        img = Image.open(path)
+        # 如果图片太大，先缩略图再返回（防止内存爆炸）
+        if max(img.size) > 1024:
+            img.thumbnail((1024, 1024))  # 最大边不超过 1024
+        return img.convert('RGB')
+    except Exception as e:
+        print(f"[ERROR] Unable to load image {path}: {e}")
+        # 返回空白图像占位符（避免整个训练中断）
+        return Image.new('RGB', (224, 224))
+
+
+def get_data_loaders(data_dir, batch_size=32, num_workers=4, val_split=0.1, test_split=0.1, seed=1231):
+    """
+    加载扁平结构的数据集（如 Kaggle 上的 steubk/wikiart）:
+        data_dir/
+            <class_1>/
+            <class_2>/
+            ...
+
+    每个类别一个文件夹，没有现成的 train/val/test 划分，
+    因此按 seed 固定的随机划分自动切出 val_split / test_split，剩余作为 train。
+    """
+    data_transforms = get_transforms()
 
     # 用同一份扁平目录，为每种 split 各建一个 ImageFolder（transform 不同）
     full_datasets = {

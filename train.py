@@ -24,7 +24,14 @@ import numpy as np
 import argparse
 import wandb
 from data_loader import get_data_loaders
+from data_multi import get_multi_loaders, unpack, mask_logits
 # import thop
+
+# DATASETS=wikiart,pandora (see data_multi.py): several style datasets in one
+# model. Each sample carries its dataset index; logits are masked to that
+# dataset's own classes (DS_MASKS) in the loss and in the accuracy.
+MULTI = 'DATASETS' in os.environ
+DS_NAMES, DS_MASKS = None, None
 
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
 device = torch.device("cuda")
@@ -190,6 +197,9 @@ def main():
             "mla_rank": int(os.environ.get('MLA_RANK', 0)),
             "finetune_from": FINETUNE_FROM,
             "ft_lr": FT_LR if FINETUNE_FROM else None,
+            "datasets": os.environ.get('DATASETS', 'wikiart'),
+            "label_space": os.environ.get('LABEL_SPACE', 'union') if MULTI else None,
+            "exclude_list": os.path.basename(os.environ.get('EXCLUDE_LIST', '')) or None,
         },
     )
 
@@ -201,9 +211,16 @@ def main():
     #                                            num_workers=config.workers, pin_memory=True, drop_last=True)
     # num_classes = train_dataset.num_classes
 
-    dataloaders, dataset_sizes, class_names = get_data_loaders(config.DATA_DIR,
-                                                               batch_size=config.batch_size,
-                                                               num_workers=config.workers)
+    global DS_NAMES, DS_MASKS
+    if MULTI:
+        assert PLAIN, 'multi-dataset training is implemented for PLAIN_CLS=1 only'
+        dataloaders, dataset_sizes, class_names, info = get_multi_loaders(batch_size=config.batch_size,
+                                                                          num_workers=config.workers)
+        DS_NAMES, DS_MASKS = info['datasets'], info['masks']
+    else:
+        dataloaders, dataset_sizes, class_names = get_data_loaders(config.DATA_DIR,
+                                                                   batch_size=config.batch_size,
+                                                                   num_workers=config.workers)
     train_loader = dataloaders['train']
     validate_loader = dataloaders['val']
     if TRAIN_FRACTION < 1.0:
@@ -213,7 +230,7 @@ def main():
         train_loader = DataLoader(train_subset, batch_size=config.batch_size, shuffle=True,
                                   num_workers=config.workers, pin_memory=True, drop_last=True)
     print('Train images: {}, val images: {}'.format(len(train_loader.dataset), len(validate_loader.dataset)))
-    num_classes = 27
+    num_classes = len(class_names)
 
     # Initialize model
     logs = {}
@@ -391,6 +408,7 @@ def main():
                 "val/top5": logs['val_topk_accuracy'][1],
                 "val/best_acc": best_acc,
                 "epoch": logs['epoch'],
+                **{'val/top1_{}'.format(k): v for k, v in logs.get('val_per_dataset', {}).items()},
             }, step=(epoch + 1) * len(train_loader))
             print('wandb.log OK for epoch {}'.format(logs['epoch']), flush=True)
         except Exception as e:
@@ -427,11 +445,13 @@ def zero_shot_check(net, data_loader, batches=32):
     the image and text towers are not in the same space."""
     net.eval()
     correct = total = 0
-    for i, (X, y) in enumerate(data_loader):
+    for i, batch in enumerate(data_loader):
         if i >= batches:
             break
+        X, y, d = unpack(batch)
         with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
             p = net(X.to(device))[0]
+        p = mask_logits(p.float(), None if d is None else d.to(p.device), DS_MASKS)
         correct += (p.argmax(1).cpu() == y).sum().item()
         total += len(y)
     print('zero-shot (text prototypes, no training): {:.2f}% on {} val images'.format(100. * correct / total, total))
@@ -469,7 +489,7 @@ def train(**kwargs):
     net.train()
     batch_len = len(data_loader)
     batch_info = ''
-    for i, (X, y) in enumerate(data_loader):
+    for i, batch in enumerate(data_loader):
         # float_iter = float(i) / batch_len
         # adjust_learning(optimizer, epoch, float_iter)
         # now_lr = optimizer.param_groups[0]['lr']
@@ -478,13 +498,16 @@ def train(**kwargs):
             optimizer.zero_grad()
 
         # obtain data for training
+        X, y, d = unpack(batch)
         X = X.to(device)
         y = y.to(device)
+        d = None if d is None else d.to(device)
 
         # raw image
         with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
             y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X)
         y_pred_raw, y_pred_aux, attention_map, h = y_pred_raw.float(), y_pred_aux.float(), attention_map.float(), h.float()
+        y_pred_raw, y_pred_aux = mask_logits(y_pred_raw, d, DS_MASKS), mask_logits(y_pred_aux, d, DS_MASKS)
         # crop-policy outputs of this (raw-image) pass; the aug-image pass below overwrites them
         model = getattr(net, 'module', net)
         rl_logp, rl_entropy = getattr(model, 'rl_logp', None), getattr(model, 'rl_entropy', None)
@@ -612,11 +635,14 @@ def validate(**kwargs):
     # begin validation
     start_time = time.time()
     net.eval()
+    per_ds = {}  # dataset name -> [correct, total] (MULTI only)
     with torch.no_grad():
-        for i, (X, y) in enumerate(data_loader):
+        for i, batch in enumerate(data_loader):
             # obtain data
+            X, y, d = unpack(batch)
             X = X.to(device)
             y = y.to(device)
+            d = None if d is None else d.to(device)
 
             ##################################
             # Raw Image
@@ -624,6 +650,14 @@ def validate(**kwargs):
             with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
                 y_pred_raw, y_pred_aux, _, attention_map, _ = net(X)
             y_pred_raw, y_pred_aux, attention_map = y_pred_raw.float(), y_pred_aux.float(), attention_map.float()
+            y_pred_raw, y_pred_aux = mask_logits(y_pred_raw, d, DS_MASKS), mask_logits(y_pred_aux, d, DS_MASKS)
+            if d is not None:
+                hit = y_pred_raw.argmax(1) == y
+                for di, name in enumerate(DS_NAMES):
+                    sel = d == di
+                    c = per_ds.setdefault(name, [0, 0])
+                    c[0] += int(hit[sel].sum())
+                    c[1] += int(sel.sum())
 
             if PLAIN:
                 y_pred = y_pred_raw
@@ -650,6 +684,10 @@ def validate(**kwargs):
     # end of validation
     logs['val_{}'.format(loss_container.name)] = epoch_loss
     logs['val_{}'.format(raw_metric.name)] = epoch_acc
+    if per_ds:
+        logs['val_per_dataset'] = {k: 100. * c / max(n, 1) for k, (c, n) in per_ds.items()}
+        print('val top1 per dataset: ' + ', '.join('{} {:.2f} ({} imgs)'.format(k, logs['val_per_dataset'][k], n)
+                                                   for k, (c, n) in per_ds.items()), flush=True)
     end_time = time.time()
 
     # batch_info = 'Val Loss {:.4f}, Val Acc ({:.2f}, {:.2f})'.format(epoch_loss, epoch_acc[0], epoch_acc[1])

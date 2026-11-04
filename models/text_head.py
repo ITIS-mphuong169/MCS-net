@@ -44,6 +44,7 @@ TEXT_MODELS = {
 
 
 def style_name(folder):
+    folder = folder.split('|')[0]  # LABEL_SPACE=separate names are '<style>|<dataset>'
     return STYLE_NAMES.get(folder, folder.replace('_', ' '))
 
 

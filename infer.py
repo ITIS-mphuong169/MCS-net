@@ -21,7 +21,13 @@ import torch.nn as nn
 from models import WSDAN_MCS
 from utils import TopKAccuracyMetric, batch_augment
 from data_loader import get_data_loaders
+from data_multi import get_multi_loaders, unpack, mask_logits
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+
+# DATASETS=... (data_multi.py): evaluate each dataset's test split inside its
+# own label space, plus the pooled numbers
+MULTI = 'DATASETS' in os.environ
+DS_NAMES, DS_MASKS = None, None
 
 # GPU settings
 assert torch.cuda.is_available()
@@ -42,7 +48,12 @@ def main():
     out_dir = os.environ.get('INFER_OUT', config.save_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    dataloaders, dataset_sizes, class_names = get_data_loaders(DATA_DIR, batch_size=config.batch_size)
+    global DS_NAMES, DS_MASKS
+    if MULTI:
+        dataloaders, dataset_sizes, class_names, info = get_multi_loaders(batch_size=config.batch_size)
+        DS_NAMES, DS_MASKS = info['datasets'], info['masks']
+    else:
+        dataloaders, dataset_sizes, class_names = get_data_loaders(DATA_DIR, batch_size=config.batch_size)
     test_loader = dataloaders['test']
     print('Test images: {}'.format(dataset_sizes['test']))
 
@@ -89,17 +100,21 @@ def evaluate(data_loader, net, class_names):
         preds['tta'] = []
     top5 = {k: TopKAccuracyMetric(topk=(1, 5)) for k in preds}
     all_labels = []
+    all_ds = []
 
     start_time = time.time()
     net.eval()
     with torch.no_grad():
-        for X, y in tqdm(data_loader, unit=' batches'):
+        for batch in tqdm(data_loader, unit=' batches'):
+            X, y, d = unpack(batch)
             X = X.to(device)
             y = y.to(device)
+            d = None if d is None else d.to(device)
             X_m = torch.flip(X, [3])
 
             # model returns (p, p_effect, feature_matrix, attention_map, h)
             y_pred_raw, _, _, attention_map, _ = net(X)
+            y_pred_raw = mask_logits(y_pred_raw.float(), d, DS_MASKS)
             outputs = {'center_crop': y_pred_raw}
             if USE_TWO_VIEW:
                 y_pred_crop = net(batch_augment(X, attention_map, mode='crop', theta=0.5, padding_ratio=0.1))[0]
@@ -117,33 +132,59 @@ def evaluate(data_loader, net, class_names):
                 top5[name](y_pred, y)
                 preds[name].extend(y_pred.argmax(1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
+            if d is not None:
+                all_ds.extend(d.cpu().numpy())
 
     print('\nTime {:.0f}s, {} test images'.format(time.time() - start_time, len(all_labels)))
-    labels = list(range(len(class_names)))
+    all_labels = np.array(all_labels)
+    preds = {k: np.array(v) for k, v in preds.items()}
     results = {'num_test_images': len(all_labels)}
     for name, p in preds.items():
-        r = {
-            'accuracy': accuracy_score(all_labels, p),
-            'top5_accuracy': top5[name].corrects[1] / top5[name].num_samples,
-            'precision_macro': precision_score(all_labels, p, average='macro', zero_division=0),
-            'recall_macro': recall_score(all_labels, p, average='macro', zero_division=0),
-            'f1_macro': f1_score(all_labels, p, average='macro', zero_division=0),
-            'precision_weighted': precision_score(all_labels, p, average='weighted', zero_division=0),
-            'recall_weighted': recall_score(all_labels, p, average='weighted', zero_division=0),
-            'f1_weighted': f1_score(all_labels, p, average='weighted', zero_division=0),
-        }
-        print('\n=== {} ==='.format(name))
-        for k, v in r.items():
-            print('{:20s} {:.4f}'.format(k, v))
-        r['per_class'] = classification_report(all_labels, p, labels=labels, target_names=class_names,
-                                               output_dict=True, zero_division=0)
-        results[name] = r
-    results['_preds'] = dict(labels=np.array(all_labels), **{k: np.array(v) for k, v in preds.items()})
+        results[name] = metrics(all_labels, p, list(range(len(class_names))), class_names, name,
+                                top5=top5[name].corrects[1] / top5[name].num_samples)
+    results['_preds'] = dict(labels=all_labels, **preds)
 
-    print('\n=== per-class report (center_crop) ===')
-    print(classification_report(all_labels, preds['center_crop'], labels=labels,
-                                target_names=class_names, digits=4, zero_division=0))
+    if all_ds:
+        # per dataset, inside its own label space (the masks already
+        # restrict the argmax to it)
+        all_ds = np.array(all_ds)
+        results['_preds']['dataset'] = all_ds
+        results['datasets'] = DS_NAMES
+        for di, ds_name in enumerate(DS_NAMES):
+            sel = all_ds == di
+            labels = [c for c in range(len(class_names)) if DS_MASKS[di, c]]
+            names = [class_names[c] for c in labels]
+            results[ds_name] = {}
+            for name, p in preds.items():
+                results[ds_name][name] = metrics(all_labels[sel], p[sel], labels, names,
+                                                 '{} / {}'.format(ds_name, name))
+            print('\n=== per-class report ({}, center_crop) ==='.format(ds_name))
+            print(classification_report(all_labels[sel], preds['center_crop'][sel], labels=labels,
+                                        target_names=names, digits=4, zero_division=0))
+    else:
+        print('\n=== per-class report (center_crop) ===')
+        print(classification_report(all_labels, preds['center_crop'], labels=list(range(len(class_names))),
+                                    target_names=class_names, digits=4, zero_division=0))
     return results
+
+
+def metrics(y, p, labels, names, title, top5=None):
+    r = {
+        'accuracy': accuracy_score(y, p),
+        'precision_macro': precision_score(y, p, labels=labels, average='macro', zero_division=0),
+        'recall_macro': recall_score(y, p, labels=labels, average='macro', zero_division=0),
+        'f1_macro': f1_score(y, p, labels=labels, average='macro', zero_division=0),
+        'precision_weighted': precision_score(y, p, labels=labels, average='weighted', zero_division=0),
+        'recall_weighted': recall_score(y, p, labels=labels, average='weighted', zero_division=0),
+        'f1_weighted': f1_score(y, p, labels=labels, average='weighted', zero_division=0),
+    }
+    if top5 is not None:
+        r['top5_accuracy'] = top5
+    print('\n=== {} === ({} images)'.format(title, len(y)))
+    for k, v in r.items():
+        print('{:20s} {:.4f}'.format(k, v))
+    r['per_class'] = classification_report(y, p, labels=labels, target_names=names, output_dict=True, zero_division=0)
+    return r
 
 
 if __name__ == '__main__':
