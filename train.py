@@ -158,6 +158,8 @@ def main():
             "learning_rate": config.learning_rate,
             "net": config.net,
             "plain_cls": PLAIN,
+            "text_init": os.environ.get("TEXT_INIT", "0") != "0",
+            "text_freeze": os.environ.get("TEXT_FREEZE", "0") != "0",
             "optim": OPTIM,
             "backbone_lr_mult": BACKBONE_LR_MULT,
             "sched": SCHED,
@@ -216,7 +218,8 @@ def main():
     # Initialize model
     logs = {}
     start_epoch = 0
-    net = WSDAN_MCS(num_classes=num_classes, M=config.num_attentions, net=config.net, pretrained=True)
+    net = WSDAN_MCS(num_classes=num_classes, M=config.num_attentions, net=config.net, pretrained=True,
+                    class_names=class_names)
 
     # Resume priority: RESUME_CKPT env var > last.ckpt (written every
     # epoch) > config.ckpt (best-only). model.ckpt is only rewritten when
@@ -270,6 +273,8 @@ def main():
 
     # Use cuda
     net.to(device)
+    if getattr(net, 'text_init', False) and start_epoch == 0:
+        zero_shot_check(net, validate_loader)
     if torch.cuda.device_count() > 1:
         net = nn.DataParallel(net)
 
@@ -412,6 +417,25 @@ def main():
         pbar.close()
 
     wandb.finish()
+
+
+@torch.no_grad()
+def zero_shot_check(net, data_loader, batches=32):
+    """TEXT_INIT sanity check before any training: accuracy of the untrained
+    text-initialised head on the first val batches. CLIP zero-shot on art
+    styles should land well above chance (1/27 = 3.7%); near chance means
+    the image and text towers are not in the same space."""
+    net.eval()
+    correct = total = 0
+    for i, (X, y) in enumerate(data_loader):
+        if i >= batches:
+            break
+        with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
+            p = net(X.to(device))[0]
+        correct += (p.argmax(1).cpu() == y).sum().item()
+        total += len(y)
+    print('zero-shot (text prototypes, no training): {:.2f}% on {} val images'.format(100. * correct / total, total))
+    return correct / total
 
 
 def adjust_learning(optimizer, epoch, iter):

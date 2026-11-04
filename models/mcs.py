@@ -285,12 +285,17 @@ class ViTFeatures(nn.Module):
     trained with their own, so the input is re-normalised here (a fixed
     affine map) rather than by changing data_loader.py for every run."""
 
-    def __init__(self, backbone):
+    def __init__(self, backbone, keep_proj=False):
         super(ViTFeatures, self).__init__()
         import timm
         self.backbone = backbone
         self.num_features = backbone.num_features
         self.num_prefix_tokens = getattr(backbone, 'num_prefix_tokens', 1)
+        # CLIP's image->joint-space projection (timm keeps it as 'head' when
+        # the model is created with its pretrained num_classes = embed dim);
+        # needed to compare the image with text prototypes (TEXT_INIT)
+        self.proj = backbone.head if keep_proj and isinstance(backbone.head, nn.Linear) else None
+        self.embed_dim = self.proj.out_features if self.proj is not None else self.num_features
         cfg = timm.data.resolve_data_config({}, model=backbone)
         imagenet_mean, imagenet_std = torch.tensor([0.485, 0.456, 0.406]), torch.tensor([0.229, 0.224, 0.225])
         mean, std = torch.tensor(cfg['mean']), torch.tensor(cfg['std'])
@@ -396,11 +401,16 @@ def convert_mha_to_mla(state_dict, rank, prefix='part_transformer.layers.0.'):
 
 
 class WSDAN_MCS(nn.Module):
-    def __init__(self, num_classes, M=32, net='inception_mixed_6e', pretrained=False):
+    def __init__(self, num_classes, M=32, net='inception_mixed_6e', pretrained=False, class_names=None):
         super(WSDAN_MCS, self).__init__()
         self.num_classes = num_classes
         self.M = M
         self.net = net
+        # TEXT_INIT=1 (CLIP backbones, PLAIN_CLS only): the classifier is a
+        # cosine head initialised from the text embeddings of the class
+        # names (models/text_head.py). With pretrained=False (infer.py) the
+        # prototypes come from the checkpoint, so no text tower is loaded.
+        self.text_init = os.environ.get('TEXT_INIT', '0') != '0'
 
         # Network Initialization
         if 'inception' in net:
@@ -422,8 +432,8 @@ class WSDAN_MCS(nn.Module):
             self.num_features = 2048
         elif 'vit' in net:
             import timm
-            backbone = timm.create_model(net, pretrained=pretrained, num_classes=0)
-            self.features = ViTFeatures(backbone)
+            backbone = timm.create_model(net, pretrained=pretrained, **({} if self.text_init else {'num_classes': 0}))
+            self.features = ViTFeatures(backbone, keep_proj=self.text_init)
             self.num_features = self.features.num_features
             print('==> using timm ViT backbone: %s, num_features=%d' % (net, self.num_features))
         elif 'swin' in net or 'convnext' in net:
@@ -442,8 +452,15 @@ class WSDAN_MCS(nn.Module):
         # attention / relation modules add must show up over this number.
         self.plain = os.environ.get('PLAIN_CLS', '0') != '0'
         self.fc_dropout = nn.Dropout(float(os.environ.get('FC_DROPOUT', 0)))
-        if self.plain:
+        if self.text_init:
+            from models.text_head import CosineClassifier, text_prototypes
+            assert self.plain and getattr(self.features, 'proj', None) is not None, \
+                'TEXT_INIT needs PLAIN_CLS=1 and a CLIP ViT backbone'
+            protos = text_prototypes(class_names, net) if pretrained and class_names else None
+            self.fc = CosineClassifier(self.features.embed_dim, self.num_classes, protos)
+        elif self.plain:
             self.fc = nn.Linear(self.num_features, self.num_classes)
+        if self.plain:
             self.part_attn = self.rl_select = False
             self.mla_rank = 0
             self.policy = None
@@ -594,6 +611,8 @@ class WSDAN_MCS(nn.Module):
         normalised pooled feature (SCLM weight must be 0 for a plain run)."""
         feature_maps = self.features(x)
         pooled = self._pooled(feature_maps)
+        if self.text_init:
+            pooled = self.features.proj(pooled)  # into CLIP's joint image-text space
         p = self.fc(self.fc_dropout(pooled))
         attention_map = torch.ones_like(feature_maps[:, :1])
         return p, torch.zeros_like(p), pooled, attention_map, F.normalize(pooled.float(), dim=-1)

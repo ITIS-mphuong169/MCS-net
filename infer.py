@@ -46,7 +46,8 @@ def main():
     test_loader = dataloaders['test']
     print('Test images: {}'.format(dataset_sizes['test']))
 
-    net = WSDAN_MCS(num_classes=len(class_names), M=config.num_attentions, net=config.net, pretrained=False)
+    net = WSDAN_MCS(num_classes=len(class_names), M=config.num_attentions, net=config.net, pretrained=False,
+                    class_names=class_names)
     checkpoint = torch.load(ckpt, weights_only=False, map_location='cpu')
     state_dict = checkpoint['state_dict']
     # WSDAN_MCS.load_state_dict silently skips mismatched keys, so check
