@@ -83,3 +83,63 @@ class CosineClassifier(nn.Module):
     def forward(self, x):
         scale = self.log_scale.exp().clamp(max=100.)
         return scale * F.normalize(x.float(), dim=-1) @ F.normalize(self.weight, dim=-1).t()
+
+    def pairwise(self, x):
+        """x: (B, C, D), one feature per class -> (B, C) logits, feature c
+        scored against prototype c only."""
+        scale = self.log_scale.exp().clamp(max=100.)
+        return scale * (F.normalize(x.float(), dim=-1) * F.normalize(self.weight, dim=-1)).sum(-1)
+
+
+class LabelQueryAttention(nn.Module):
+    """Label-query multi-head attention head (LABEL_ATTN=1).
+
+    The cosine classifier sees one global vector per image (the CLS token).
+    Here every class also looks at the image itself: its text prototype is
+    the query of a multi-head cross-attention over the 14x14 patch tokens
+    (keys / values), so each style pools the patches that are evidence for
+    it (label queries as in Query2Label / ML-Decoder, but with the queries
+    anchored to the CLIP text embeddings of the style names). The attended
+    feature o_c of class c is scored against class c's own prototype and
+    added to the CLS logit through a gate that starts at zero:
+
+        logit_c = s * cos(z, w_c) + gate * s * cos(o_c, w_c)
+
+    so training starts exactly from the text-anchored classifier and the
+    attention branch contributes only what it learns (the gate is logged).
+    The query gets no residual path to the output: o_c must come from the
+    image, otherwise cos(o_c, w_c) would be high for every image.
+
+    Multi-dataset: a learned embedding of the sample's dataset (zero-init)
+    is added to the queries, so the same style name can be looked for
+    differently in WikiArt and in Pandora18k - dataset-aware queries, the
+    per-dataset expert of Erudite at the cost of one vector per dataset.
+    """
+
+    def __init__(self, patch_dim, embed_dim, num_datasets=1, heads=8, proj_init=None):
+        super(LabelQueryAttention, self).__init__()
+        # patch tokens -> joint image-text space; starts as CLIP's own visual
+        # projection (the one applied to the CLS token)
+        self.patch_proj = nn.Linear(patch_dim, embed_dim, bias=False)
+        if proj_init is not None and proj_init.shape == self.patch_proj.weight.shape:
+            with torch.no_grad():
+                self.patch_proj.weight.copy_(proj_init)
+        self.patch_norm = nn.LayerNorm(embed_dim)
+        self.query_norm = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, heads, batch_first=True)
+        self.ds_embed = nn.Embedding(max(num_datasets, 1), embed_dim)
+        nn.init.zeros_(self.ds_embed.weight)
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def forward(self, patches, prototypes, ds=None, need_weights=False):
+        """patches (B, N, patch_dim), prototypes (C, embed_dim), ds (B,) dataset
+        index or None -> attended class features (B, C, embed_dim) and, with
+        need_weights, the head-averaged attention (B, C, N)."""
+        B = patches.size(0)
+        keys = self.patch_norm(self.patch_proj(patches))
+        queries = F.normalize(prototypes, dim=-1).to(keys.dtype).unsqueeze(0).expand(B, -1, -1)
+        if ds is None:
+            ds = torch.zeros(B, dtype=torch.long, device=patches.device)
+        queries = self.query_norm(queries + self.ds_embed(ds).to(keys.dtype).unsqueeze(1))
+        out, weights = self.attn(queries, keys, keys, need_weights=need_weights)
+        return out, weights

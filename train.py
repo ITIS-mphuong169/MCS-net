@@ -200,6 +200,8 @@ def main():
             "datasets": os.environ.get('DATASETS', 'wikiart'),
             "label_space": os.environ.get('LABEL_SPACE', 'union') if MULTI else None,
             "exclude_list": os.path.basename(os.environ.get('EXCLUDE_LIST', '')) or None,
+            "label_attn": os.environ.get('LABEL_ATTN', '0') != '0',
+            "label_attn_heads": int(os.environ.get('LABEL_ATTN_HEADS', 8)),
         },
     )
 
@@ -236,7 +238,7 @@ def main():
     logs = {}
     start_epoch = 0
     net = WSDAN_MCS(num_classes=num_classes, M=config.num_attentions, net=config.net, pretrained=True,
-                    class_names=class_names)
+                    class_names=class_names, num_datasets=len(DS_NAMES) if MULTI else 1)
 
     # Resume priority: RESUME_CKPT env var > last.ckpt (written every
     # epoch) > config.ckpt (best-only). model.ckpt is only rewritten when
@@ -407,6 +409,8 @@ def main():
                 "val/top1": logs['val_topk_accuracy'][0],
                 "val/top5": logs['val_topk_accuracy'][1],
                 "val/best_acc": best_acc,
+                **({'train/attn_gate': float(getattr(net, 'module', net).label_attn.gate)}
+                   if getattr(getattr(net, 'module', net), 'label_attn', None) is not None else {}),
                 "epoch": logs['epoch'],
                 **{'val/top1_{}'.format(k): v for k, v in logs.get('val_per_dataset', {}).items()},
             }, step=(epoch + 1) * len(train_loader))
@@ -450,7 +454,7 @@ def zero_shot_check(net, data_loader, batches=32):
             break
         X, y, d = unpack(batch)
         with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
-            p = net(X.to(device))[0]
+            p = (net(X.to(device)) if d is None else net(X.to(device), d.to(device)))[0]
         p = mask_logits(p.float(), None if d is None else d.to(p.device), DS_MASKS)
         correct += (p.argmax(1).cpu() == y).sum().item()
         total += len(y)
@@ -505,7 +509,7 @@ def train(**kwargs):
 
         # raw image
         with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
-            y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X)
+            y_pred_raw, y_pred_aux, feature_matrix, attention_map, h = net(X) if d is None else net(X, d)
         y_pred_raw, y_pred_aux, attention_map, h = y_pred_raw.float(), y_pred_aux.float(), attention_map.float(), h.float()
         y_pred_raw, y_pred_aux = mask_logits(y_pred_raw, d, DS_MASKS), mask_logits(y_pred_aux, d, DS_MASKS)
         # crop-policy outputs of this (raw-image) pass; the aug-image pass below overwrites them
@@ -648,7 +652,7 @@ def validate(**kwargs):
             # Raw Image
             ##################################
             with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
-                y_pred_raw, y_pred_aux, _, attention_map, _ = net(X)
+                y_pred_raw, y_pred_aux, _, attention_map, _ = net(X) if d is None else net(X, d)
             y_pred_raw, y_pred_aux, attention_map = y_pred_raw.float(), y_pred_aux.float(), attention_map.float()
             y_pred_raw, y_pred_aux = mask_logits(y_pred_raw, d, DS_MASKS), mask_logits(y_pred_aux, d, DS_MASKS)
             if d is not None:

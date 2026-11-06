@@ -58,7 +58,7 @@ def main():
     print('Test images: {}'.format(dataset_sizes['test']))
 
     net = WSDAN_MCS(num_classes=len(class_names), M=config.num_attentions, net=config.net, pretrained=False,
-                    class_names=class_names)
+                    class_names=class_names, num_datasets=len(DS_NAMES) if MULTI else 1)
     checkpoint = torch.load(ckpt, weights_only=False, map_location='cpu')
     state_dict = checkpoint['state_dict']
     # WSDAN_MCS.load_state_dict silently skips mismatched keys, so check
@@ -113,7 +113,7 @@ def evaluate(data_loader, net, class_names):
             X_m = torch.flip(X, [3])
 
             # model returns (p, p_effect, feature_matrix, attention_map, h)
-            y_pred_raw, _, _, attention_map, _ = net(X)
+            y_pred_raw, _, _, attention_map, _ = net(X) if d is None else net(X, d)
             y_pred_raw = mask_logits(y_pred_raw.float(), d, DS_MASKS)
             outputs = {'center_crop': y_pred_raw}
             if USE_TWO_VIEW:

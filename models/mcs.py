@@ -401,9 +401,11 @@ def convert_mha_to_mla(state_dict, rank, prefix='part_transformer.layers.0.'):
 
 
 class WSDAN_MCS(nn.Module):
-    def __init__(self, num_classes, M=32, net='inception_mixed_6e', pretrained=False, class_names=None):
+    def __init__(self, num_classes, M=32, net='inception_mixed_6e', pretrained=False, class_names=None,
+                 num_datasets=1):
         super(WSDAN_MCS, self).__init__()
         self.num_classes = num_classes
+        self.label_attn = None
         self.M = M
         self.net = net
         # TEXT_INIT=1 (CLIP backbones, PLAIN_CLS only): the classifier is a
@@ -458,6 +460,15 @@ class WSDAN_MCS(nn.Module):
                 'TEXT_INIT needs PLAIN_CLS=1 and a CLIP ViT backbone'
             protos = text_prototypes(class_names, net) if pretrained and class_names else None
             self.fc = CosineClassifier(self.features.embed_dim, self.num_classes, protos)
+            # LABEL_ATTN=1: label-query multi-head attention over the patch
+            # tokens on top of the cosine head (models/text_head.py)
+            if os.environ.get('LABEL_ATTN', '0') != '0':
+                from models.text_head import LabelQueryAttention
+                self.label_attn = LabelQueryAttention(
+                    self.num_features, self.features.embed_dim, num_datasets=num_datasets,
+                    heads=int(os.environ.get('LABEL_ATTN_HEADS', 8)), proj_init=self.features.proj.weight.detach())
+                print('==> label-query attention head: {} heads, {} datasets'.format(
+                    self.label_attn.attn.num_heads, num_datasets))
         elif self.plain:
             self.fc = nn.Linear(self.num_features, self.num_classes)
         if self.plain:
@@ -604,18 +615,33 @@ class WSDAN_MCS(nn.Module):
         pooled = getattr(self.features, 'pooled', None)
         return pooled if pooled is not None else feature_maps.mean(dim=(2, 3))
 
-    def forward_plain(self, x):
+    def forward_plain(self, x, ds=None):
         """Same 5-tuple as forward() so train.py / infer.py need no special
         case: the counterfactual logits are zero (no CCAM), the 'attention
         map' is uniform (a crop of it is the whole image), h is the
-        normalised pooled feature (SCLM weight must be 0 for a plain run)."""
+        normalised pooled feature (SCLM weight must be 0 for a plain run).
+        ds: (B,) dataset index of each image (multi-dataset runs)."""
         feature_maps = self.features(x)
         pooled = self._pooled(feature_maps)
         if self.text_init:
             pooled = self.features.proj(pooled)  # into CLIP's joint image-text space
         p = self.fc(self.fc_dropout(pooled))
+        if self.label_attn is not None:
+            patches = feature_maps.flatten(2).transpose(1, 2)  # (B, N, C) patch tokens
+            attended, _ = self.label_attn(patches, self.fc.weight, ds)
+            p = p + self.label_attn.gate * self.fc.pairwise(attended)
         attention_map = torch.ones_like(feature_maps[:, :1])
         return p, torch.zeros_like(p), pooled, attention_map, F.normalize(pooled.float(), dim=-1)
+
+    @torch.no_grad()
+    def label_attention_maps(self, x, ds=None):
+        """(B, num_classes, H, W): where each class query looks (head-averaged
+        attention over the patch grid). For figures."""
+        assert self.label_attn is not None, 'needs LABEL_ATTN=1'
+        feature_maps = self.features(x)
+        patches = feature_maps.flatten(2).transpose(1, 2)
+        _, w = self.label_attn(patches, self.fc.weight, ds, need_weights=True)
+        return w.reshape(w.size(0), w.size(1), feature_maps.size(2), feature_maps.size(3))
 
     def visualize(self, x):
         batch_size = x.size(0)
@@ -639,10 +665,10 @@ class WSDAN_MCS(nn.Module):
 
         return p, attention_maps
 
-    def forward(self, x):
+    def forward(self, x, ds=None):
         batch_size = x.size(0)
         if self.plain:
-            return self.forward_plain(x)
+            return self.forward_plain(x, ds)
 
         # Feature Maps, Attention Maps and Feature Matrix
         feature_maps = self.features(x)
