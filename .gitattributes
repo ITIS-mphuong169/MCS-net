@@ -1,2 +1,3 @@
-# .bat files must keep CRLF line endings, or cmd.exe can mis-read labels
-*.bat text eol=crlf
+# Batch files must keep CRLF line endings exactly as committed: cmd.exe can mis-read labels in LF-only files.
+# "-text" stops git from converting them on any machine, including ZIP downloads.
+*.bat -text
