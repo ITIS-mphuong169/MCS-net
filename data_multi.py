@@ -85,7 +85,24 @@ def list_wikiart(root):
     """(relative path, style) in torchvision ImageFolder order - the order
     data_loader.py's split indices refer to."""
     folder = datasets.ImageFolder(root)
-    return [(os.path.relpath(p, root), folder.classes[c]) for p, c in folder.samples]
+    samples = [(os.path.relpath(p, root), folder.classes[c]) for p, c in folder.samples]
+    # A resized copy (resize_dataset.py) carries the original's listing: the
+    # split is by position in this list, so the copy must list identically
+    # or the test set would silently differ from every earlier run.
+    manifest = os.path.join(root, 'MANIFEST.txt')
+    if os.path.isfile(manifest):
+        with open(manifest, encoding='utf-8') as f:
+            expected = f.read().splitlines()
+        got = [rel for rel, _ in samples]
+        if got != expected:
+            first = next((i for i, (a, b) in enumerate(zip(got, expected)) if a != b), min(len(got), len(expected)))
+            raise AssertionError('{}: the copy lists {} images, its MANIFEST {} - first difference at index {} '
+                                 '({!r} vs {!r}); the split would not match the original dataset'.format(
+                                     root, len(got), len(expected), first,
+                                     got[first] if first < len(got) else None,
+                                     expected[first] if first < len(expected) else None))
+        print('{}: listing matches MANIFEST.txt ({} images) - same split as the original'.format(root, len(got)))
+    return samples
 
 
 def list_pandora(root):
@@ -112,7 +129,7 @@ LISTERS = {
 def load_exclude(path):
     excl = set()
     if path and os.path.isfile(path):
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith('#'):

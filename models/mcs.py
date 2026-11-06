@@ -621,6 +621,13 @@ class WSDAN_MCS(nn.Module):
         map' is uniform (a crop of it is the whole image), h is the
         normalised pooled feature (SCLM weight must be 0 for a plain run).
         ds: (B,) dataset index of each image (multi-dataset runs)."""
+        p, pooled, feature_maps = self.plain_logits(x, ds)
+        attention_map = torch.ones_like(feature_maps[:, :1])
+        return p, torch.zeros_like(p), pooled, attention_map, F.normalize(pooled.float(), dim=-1)
+
+    def plain_logits(self, x, ds=None):
+        """The plain classifier itself: logits, the pooled feature they are
+        computed from, and the (B, C, H, W) patch-token map."""
         feature_maps = self.features(x)
         pooled = self._pooled(feature_maps)
         if self.text_init:
@@ -630,8 +637,7 @@ class WSDAN_MCS(nn.Module):
             patches = feature_maps.flatten(2).transpose(1, 2)  # (B, N, C) patch tokens
             attended, _ = self.label_attn(patches, self.fc.weight, ds)
             p = p + self.label_attn.gate * self.fc.pairwise(attended)
-        attention_map = torch.ones_like(feature_maps[:, :1])
-        return p, torch.zeros_like(p), pooled, attention_map, F.normalize(pooled.float(), dim=-1)
+        return p, pooled, feature_maps
 
     @torch.no_grad()
     def label_attention_maps(self, x, ds=None):

@@ -10,6 +10,10 @@ image. data_multi.py drops them when EXCLUDE_LIST points at the output.
 Usage (Kaggle, ~10-15 min for 100k images on 4 CPUs):
     DATA_DIR=/kaggle/input/datasets/steubk/wikiart DATA_DIR_PANDORA=/kaggle/working/pandora18k \
         python dedup.py --out /kaggle/working/pandora18k/pandora_dups.txt
+With --wikiart-meta <name>_meta.npz (written by resize_dataset.py) the
+WikiArt hashes are read from that file instead of hashing WikiArt again:
+    DATA_DIR_PANDORA=/kaggle/temp/pandora18k python dedup.py \
+        --wikiart-meta /kaggle/working/wikiart768_meta.npz --out /kaggle/working/pandora_dups.txt
 """
 import os
 import sys
@@ -61,10 +65,19 @@ def main():
     ap.add_argument('--out', default='pandora_dups.txt')
     ap.add_argument('--hamming', type=int, default=6, help='max bits differing (of 64) to call a duplicate')
     ap.add_argument('--workers', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--wikiart-meta', default='',
+                    help='<name>_meta.npz from resize_dataset.py: reuse its WikiArt paths and hashes')
     args = ap.parse_args()
 
-    wroot = DEFAULT_ROOTS['wikiart']()
-    wikiart = list_wikiart(wroot)
+    wh = None
+    if args.wikiart_meta:
+        meta = np.load(args.wikiart_meta, allow_pickle=False)
+        wroot = args.wikiart_meta
+        wikiart = [(str(p), str(p).split('/')[0]) for p in meta['paths']]
+        wh = meta['dhash'].astype(np.uint64)
+    else:
+        wroot = DEFAULT_ROOTS['wikiart']()
+        wikiart = list_wikiart(wroot)
     proot, pandora = list_pandora(DEFAULT_ROOTS['pandora']())
     print('WikiArt {} images at {}\nPandora {} images at {}'.format(len(wikiart), wroot, len(pandora), proot))
 
@@ -77,11 +90,13 @@ def main():
     print('Pandora images whose file name also exists in WikiArt: {}'.format(len(name_hits)))
 
     # 2) perceptual hash match
-    print('hashing WikiArt ...', flush=True)
-    wh = hash_all(wroot, [r for r, _ in wikiart], args.workers)
+    if wh is None:
+        print('hashing WikiArt ...', flush=True)
+        wh = hash_all(wroot, [r for r, _ in wikiart], args.workers)
     print('hashing Pandora ...', flush=True)
     ph = hash_all(proot, [r for r, _ in pandora], args.workers)
-    table = np.frombuffer(wh.tobytes(), dtype=np.uint8).reshape(-1, 8)
+    widx = np.nonzero(wh != np.uint64(FAILED))[0]  # unreadable WikiArt images can match nothing
+    table = np.frombuffer(wh[widx].tobytes(), dtype=np.uint8).reshape(-1, 8)
 
     dups = []
     label_pairs = {}
@@ -92,7 +107,7 @@ def main():
         j = int(dist.argmin())
         if dist[j] <= args.hamming:
             rel, pstyle = pandora[i]
-            wrel, wstyle = wikiart[j]
+            wrel, wstyle = wikiart[int(widx[j])]
             dups.append((rel, pstyle, wrel, wstyle, int(dist[j])))
             label_pairs[(pstyle, wstyle)] = label_pairs.get((pstyle, wstyle), 0) + 1
 
@@ -108,12 +123,12 @@ def main():
         print('  {:28s} -> {:28s} {}'.format(ps, ws, n))
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, 'w') as f:
+    with open(args.out, 'w', encoding='utf-8') as f:
         f.write('# Pandora18k images within Hamming {} of a WikiArt image (dedup.py); '
                 'format: pandora/<relative path>\n'.format(args.hamming))
         for rel, pstyle, wrel, wstyle, dist in dups:
             f.write('pandora/{}\n'.format(rel))
-    with open(os.path.splitext(args.out)[0] + '_pairs.tsv', 'w') as f:
+    with open(os.path.splitext(args.out)[0] + '_pairs.tsv', 'w', encoding='utf-8') as f:
         f.write('pandora_path\tpandora_style\twikiart_path\twikiart_style\thamming\n')
         for row in dups:
             f.write('\t'.join(str(x) for x in row) + '\n')
