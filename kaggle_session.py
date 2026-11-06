@@ -181,6 +181,14 @@ def do_run(tag, datasets, label_space, label_attn):
         shutil.copytree(os.path.dirname(prev), out, dirs_exist_ok=True)
         return 'done in an earlier session'
     env = dict(os.environ, ABLATION_TAG=tag, DATASETS=datasets, LABEL_SPACE=label_space, LABEL_ATTN=label_attn)
+    # a run cut off in an earlier session: its last.ckpt (written every epoch)
+    # comes back through the attached output, and train.py resumes from it
+    dst = os.path.join(save_dir(tag), 'last.ckpt')
+    prev_ck = find('wikiart_fullpaper_selfattn_abl_{}/last.ckpt'.format(tag))
+    if prev_ck and not os.path.isfile(dst):
+        os.makedirs(save_dir(tag), exist_ok=True)
+        shutil.copy(prev_ck, dst)
+        log('{} resumes from {}'.format(tag, prev_ck))
     t = time.time()
     if call([PY, 'train.py'], env) != 0:
         return 'train.py FAILED'
