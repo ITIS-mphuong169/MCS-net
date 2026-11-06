@@ -12,6 +12,20 @@ Hai run sẽ được chạy, cùng một công thức, mỗi run 100 epoch:
 
 Cả hai đều: CLIP ViT-B/16, lớp phân loại neo theo chữ, attention theo nhãn, AdamW, cosine, bfloat16.
 
+## Cách nhanh nhất: bấm đúp một file
+
+1. Mở PowerShell trong thư mục `MCS-Net`, chạy một lần: `git pull origin exp/regularize`
+2. Bấm đúp `server\chay_clip.bat`.
+
+Lần đầu nó hỏi đường dẫn thư mục WikiArt (rồi nhớ lại) và API key W&B. Sau đó nó tự làm lần lượt: cài gói, kiểm tra máy, chạy thử 10 phút, train hai run 100 epoch, chấm test và McNemar. Cuối cùng nó ghi bảng tóm tắt vào `C:\Users\<ten>\results\summary_clip.txt`: gửi tôi file đó.
+
+- **Bị dừng giữa chừng** (mất điện, tắt máy): bấm đúp lại, nó tự tiếp tục từ epoch cuối, bước chạy thử không lặp lại.
+- **Báo lỗi**: cửa sổ giữ nguyên, chụp màn hình các dòng có `!!` gửi tôi.
+- **Máy không ngủ** khi đang chạy: script tự giữ máy thức. Chỉ cần để cửa sổ mở.
+- **Đổi đường dẫn WikiArt**: xoá file `C:\Users\<ten>\.mcs_data_dir` rồi bấm đúp lại.
+
+Các mục dưới đây là cách làm từng bước bằng tay, dùng khi cần.
+
 ## 1. Chuẩn bị một lần
 
 **1a. Lấy code mới nhất**
