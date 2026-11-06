@@ -266,7 +266,8 @@ def main():
     ap.add_argument('--mag', type=int, default=2, help='phong to cua manh chi tiet: 2 hoac 3 (theo VERDICT cua phep thu)')
     ap.add_argument('--arch', choices=list(ARCHS), default='b16', help='b16 = ViT-B/16 (mac dinh), l14 = ViT-L/14 (nang ~4 lan)')
     ap.add_argument('--gpu', type=int, default=0)
-    ap.add_argument('--workers', type=int, default=max(2, min(8, (os.cpu_count() or 4) - 2)))
+    ap.add_argument('--workers', type=int, default=max(2, min(6, (os.cpu_count() or 4) - 2)),
+                    help='so tien trinh doc anh; Windows moi tien trinh ton ~1GB RAM, giam xuong 4 neu may treo / het RAM')
     ap.add_argument('--batch-size', type=int, default=0)
     ap.add_argument('--grad-accum', type=int, default=0)
     ap.add_argument('--eval-batch', type=int, default=16)
