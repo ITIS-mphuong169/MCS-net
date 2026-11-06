@@ -80,7 +80,7 @@ from data_multi import list_wikiart, seed_split
 Image.MAX_IMAGE_PIXELS = 1000000000
 
 MAGS = [int(m) for m in os.environ.get('PROBE_MAGS', '2,3').split(',') if m]
-G = 3                      # 3x3 grid of crops per magnification
+G = int(os.environ.get('PROBE_GRID', 3))   # G x G grid of crops per magnification (the training views use 3)
 P = G * G
 M = len(MAGS)
 VD = 1 + M * P             # global + detail crops
@@ -97,6 +97,15 @@ PRETRAINED = os.environ.get('PROBE_PRETRAINED', '1') != '0'
 WORKERS = int(os.environ.get('WORKERS', 4))
 THRESH_DETAIL = 1.0        # points of accuracy 'global + detail' must add to be worth a branch
 THRESH_SELECT = 1.0        # points a chosen position must add over a random one to be worth RL
+
+
+def paired_diff(correct_a, correct_b, n_boot=2000, seed=0):
+    """Accuracy of a minus accuracy of b, in points, with a paired bootstrap
+    95% interval over the test images: (difference, low, high)."""
+    d = correct_a.astype(np.float64) - correct_b.astype(np.float64)
+    rng = np.random.RandomState(seed)
+    boots = [d[rng.randint(0, len(d), len(d))].mean() for _ in range(n_boot)]
+    return 100. * float(d.mean()), 100. * float(np.percentile(boots, 2.5)), 100. * float(np.percentile(boots, 97.5))
 
 
 # --------------------------------------------------------------------------- views
@@ -497,19 +506,34 @@ def main():
         return out
 
     print('\n=== decision ===')
-    best_gain = -1e9
+    # The verdict is on the frozen backbone (the model the views will be
+    # trained into is not available yet): GO needs, for some magnification,
+    # 'global + detail' to beat BOTH 'global' and 'global + zoom' (the same
+    # field of view with no new pixels) by THRESH_DETAIL points, and the 95%
+    # paired-bootstrap interval of both differences to stay above zero.
+    res['verdict'] = {}
+    go_mags = []
     for src in (['frozen', 'tuned'] if has_tuned else ['frozen']):
-        for m, (g_detail, g_pixels) in gains(res[src]).items():
-            best_gain = max(best_gain, g_detail)
-            print('(a) {:7s} x{}: global + detail vs global {:+.2f} points; new pixels (detail vs zoom) {}'.format(
-                src, m, g_detail, 'not computed for this model' if g_pixels is None else '{:+.2f}'.format(g_pixels)))
+        for m in MAGS:
+            det = preds['{}/global + detail x{}'.format(src, m)] == yte
+            vs_g = paired_diff(det, preds[src + '/global'] == yte)
+            zname = '{}/global + zoom x{} (no new pixels)'.format(src, m)
+            vs_z = paired_diff(det, preds[zname] == yte) if zname in preds else None
+            res['verdict']['{} x{}'.format(src, m)] = {'vs_global': vs_g, 'vs_zoom': vs_z}
+            print('(a) {:7s} x{}: global + detail vs global {:+.2f} [{:+.2f}, {:+.2f}];  vs global + zoom {}'.format(
+                src, m, *vs_g, 'not computed' if vs_z is None else '{:+.2f} [{:+.2f}, {:+.2f}]'.format(*vs_z)))
+            if src == 'frozen' and vs_z is not None and vs_g[0] >= THRESH_DETAIL and vs_g[1] > 0 \
+                    and vs_z[0] >= THRESH_DETAIL and vs_z[1] > 0:
+                go_mags.append(m)
+    best_gain = max(v['vs_global'][0] for v in res['verdict'].values())
     sel_gain = max(r['selector_minus_random'] for r in res['position'].values())
-    res['decision'] = {'detail_gain': best_gain, 'detail_go': bool(best_gain >= THRESH_DETAIL),
+    res['decision'] = {'detail_gain': best_gain, 'detail_go': bool(go_mags), 'go_mags': go_mags,
                        'selector_gain': sel_gain, 'rl_go': bool(sel_gain >= THRESH_SELECT)}
-    print('(a) best gain {:+.2f} (threshold {:.1f}) -> detail view: {}'.format(
-        best_gain, THRESH_DETAIL, 'GO' if best_gain >= THRESH_DETAIL else 'NO-GO'))
-    print('(b) best selector gain over a random position {:+.2f} (threshold {:.1f}) -> learned / RL selection: {}'.format(
-        sel_gain, THRESH_SELECT, 'worth building' if sel_gain >= THRESH_SELECT else 'not worth it, use random or grid crops'))
+    print('\nVERDICT (a) detail view: {}'.format(
+        'GO, magnification x{}'.format(max(go_mags, key=lambda m: res['verdict']['frozen x{}'.format(m)]['vs_zoom'][0]))
+        if go_mags else 'NO-GO (no magnification adds {:.1f}+ points over both global and zoom with the interval above 0)'.format(THRESH_DETAIL)))
+    print('VERDICT (b) learned / RL selection of the position: {} (best selector gain {:+.2f}, threshold {:.1f})'.format(
+        'worth building' if sel_gain >= THRESH_SELECT else 'not worth it, use random or grid crops', sel_gain, THRESH_SELECT))
     with open(os.path.join(OUT, 'probe_detail_results.json'), 'w') as f:
         json.dump(res, f, indent=2)
     print('saved', os.path.join(OUT, 'probe_detail_results.json'))

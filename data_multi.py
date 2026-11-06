@@ -38,6 +38,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision import datasets
 
 from data_loader import get_transforms, safe_pil_loader
+from data_views import view_transforms
 
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
 
@@ -175,7 +176,7 @@ def get_multi_loaders(batch_size=32, num_workers=4, seed=1231):
     label_space = os.environ.get('LABEL_SPACE', 'union')
     assert label_space in ('union', 'separate'), label_space
     exclude = load_exclude(os.environ.get('EXCLUDE_LIST'))
-    transforms_ = get_transforms()
+    transforms_ = view_transforms(get_transforms())  # VIEWS=detail|zoom: (1 + K, 3, 224, 224) samples
 
     listed = []  # (name, root, [(rel, style)])
     for name in names:
@@ -229,5 +230,7 @@ def mask_logits(logits, d, masks):
     CE and argmax only range over that dataset's own label space."""
     if d is None or masks is None:
         return logits
-    allowed = masks.to(logits.device)[d]
+    allowed = masks.to(logits.device)[d]  # (B, classes)
+    if logits.dim() == 3:  # per-view logits (B, views, classes)
+        allowed = allowed.unsqueeze(1)
     return logits.masked_fill(~allowed, -1e4)

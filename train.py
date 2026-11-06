@@ -34,7 +34,8 @@ MULTI = 'DATASETS' in os.environ
 DS_NAMES, DS_MASKS = None, None
 
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
-device = torch.device("cuda")
+# DEVICE=cpu: end-to-end smoke tests without a GPU (use with AMP=0)
+device = torch.device(os.environ.get('DEVICE', 'cuda'))
 torch.backends.cudnn.benchmark = True
 
 # General loss functions - matches the paper's eq. 17 (L = Lcls + l1*Lcon +
@@ -120,6 +121,10 @@ rl_baseline = None
 # WEIGHT_DECAY: SGD weight decay (paper Table 2: 1e-5)
 WEIGHT_DECAY = float(os.environ.get('WEIGHT_DECAY', 1e-5))
 TRAIN_FRACTION = float(os.environ.get('TRAIN_FRACTION', 1.0))
+# VIEWS=detail|zoom (data_views.py): the loss is CE of the fused logits plus
+# VIEW_CE_WEIGHT x the mean CE of every view on its own, so each view has to
+# be informative by itself (what test-time averaging relies on)
+VIEW_CE_WEIGHT = float(os.environ.get('VIEW_CE_WEIGHT', 0.5))
 AUG_CE_WEIGHT = float(os.environ.get('AUG_CE_WEIGHT', 0.0))
 if 'LAMBDA1' in os.environ:
     config.lambda1 = float(os.environ['LAMBDA1'])
@@ -200,6 +205,11 @@ def main():
             "datasets": os.environ.get('DATASETS', 'wikiart'),
             "label_space": os.environ.get('LABEL_SPACE', 'union') if MULTI else None,
             "exclude_list": os.path.basename(os.environ.get('EXCLUDE_LIST', '')) or None,
+            "views": os.environ.get('VIEWS', 'single'),
+            "detail_mag": int(os.environ.get('DETAIL_MAG', 2)),
+            "detail_k": int(os.environ.get('DETAIL_K', 2)),
+            "view_ce_weight": VIEW_CE_WEIGHT,
+            "drop_path": float(os.environ.get('DROP_PATH', 0)),
             "label_attn": os.environ.get('LABEL_ATTN', '0') != '0',
             "label_attn_heads": int(os.environ.get('LABEL_ATTN_HEADS', 8)),
         },
@@ -411,6 +421,8 @@ def main():
                 "val/best_acc": best_acc,
                 **({'train/attn_gate': float(getattr(net, 'module', net).label_attn.gate)}
                    if getattr(getattr(net, 'module', net), 'label_attn', None) is not None else {}),
+                **({'train/view_w_global': float(torch.sigmoid(getattr(net, 'module', net).view_logit))}
+                   if hasattr(getattr(net, 'module', net), 'view_logit') else {}),
                 "epoch": logs['epoch'],
                 **{'val/top1_{}'.format(k): v for k, v in logs.get('val_per_dataset', {}).items()},
             }, step=(epoch + 1) * len(train_loader))
@@ -521,6 +533,9 @@ def train(**kwargs):
             # plain classifier: CE on the raw image only (the crop/drop/aux
             # metrics below just mirror the raw prediction)
             batch_loss = train_ce(y_pred_raw, y)
+            if y_pred_aux.dim() == 3:  # multi-view: also supervise every view on its own
+                batch_loss = batch_loss + VIEW_CE_WEIGHT * train_ce(y_pred_aux.flatten(0, 1),
+                                                                    y.repeat_interleave(y_pred_aux.size(1)))
             y_pred_aug, y_aug, y_pred_aux, y_aux = y_pred_raw, y, y_pred_raw, y
         else:
             ##################################
@@ -665,6 +680,7 @@ def validate(**kwargs):
 
             if PLAIN:
                 y_pred = y_pred_raw
+                y_pred_aux = y_pred_raw  # (multi-view models return per-view logits here)
             else:
                 crop_images3 = batch_augment(X, attention_map, mode='crop', theta=0.1, padding_ratio=0.05)
                 with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):

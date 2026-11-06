@@ -31,7 +31,7 @@ if ! gpu_ok; then
   fi
 fi
 
-"$PY" -m pip install -q numpy tqdm scikit-learn wandb pillow kaggle
+"$PY" -m pip install -q numpy tqdm scikit-learn wandb pillow kaggle timm transformers
 "$PY" - <<'PYEOF'
 import torch
 print("torch", torch.__version__, "| GPU dung duoc:", torch.cuda.is_available(), "| so GPU:", torch.cuda.device_count())

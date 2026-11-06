@@ -434,7 +434,10 @@ class WSDAN_MCS(nn.Module):
             self.num_features = 2048
         elif 'vit' in net:
             import timm
-            backbone = timm.create_model(net, pretrained=pretrained, **({} if self.text_init else {'num_classes': 0}))
+            kw = {} if self.text_init else {'num_classes': 0}
+            if float(os.environ.get('DROP_PATH', 0)) > 0:  # stochastic depth, for long fine-tuning runs
+                kw['drop_path_rate'] = float(os.environ['DROP_PATH'])
+            backbone = timm.create_model(net, pretrained=pretrained, **kw)
             self.features = ViTFeatures(backbone, keep_proj=self.text_init)
             self.num_features = self.features.num_features
             print('==> using timm ViT backbone: %s, num_features=%d' % (net, self.num_features))
@@ -454,6 +457,12 @@ class WSDAN_MCS(nn.Module):
         # attention / relation modules add must show up over this number.
         self.plain = os.environ.get('PLAIN_CLS', '0') != '0'
         self.fc_dropout = nn.Dropout(float(os.environ.get('FC_DROPOUT', 0)))
+        # VIEWS=detail|zoom (data_views.py): inputs are (B, 1 + K, 3, 224, 224)
+        # and the logits of the global view and of the mean of the detail
+        # views are mixed with a learned weight (sigmoid(0) = 0.5 at the start)
+        if os.environ.get('VIEWS', 'single') != 'single':
+            assert self.plain, 'VIEWS needs PLAIN_CLS=1'
+            self.view_logit = nn.Parameter(torch.zeros(()))
         if self.text_init:
             from models.text_head import CosineClassifier, text_prototypes
             assert self.plain and getattr(self.features, 'proj', None) is not None, \
@@ -620,10 +629,30 @@ class WSDAN_MCS(nn.Module):
         case: the counterfactual logits are zero (no CCAM), the 'attention
         map' is uniform (a crop of it is the whole image), h is the
         normalised pooled feature (SCLM weight must be 0 for a plain run).
-        ds: (B,) dataset index of each image (multi-dataset runs)."""
+        ds: (B,) dataset index of each image (multi-dataset runs).
+        x of shape (B, V, 3, H, W) is a multi-view input, see forward_views."""
+        if x.dim() == 5:
+            return self.forward_views(x, ds)
         p, pooled, feature_maps = self.plain_logits(x, ds)
         attention_map = torch.ones_like(feature_maps[:, :1])
         return p, torch.zeros_like(p), pooled, attention_map, F.normalize(pooled.float(), dim=-1)
+
+    def forward_views(self, x, ds=None):
+        """Shared backbone and head on every view; returns the same 5-tuple with
+        p = the fused logits (B, K) and, in the slot of the counterfactual
+        logits, the per-view logits (B, V, K) for the per-view loss. View 0 is
+        the global view; pooled / h / attention map are those of view 0."""
+        B, V = x.shape[:2]
+        p, pooled, fmap = self.plain_logits(x.flatten(0, 1), None if ds is None else ds.repeat_interleave(V))
+        per_view = p.view(B, V, -1)
+        if V > 1:
+            w = torch.sigmoid(self.view_logit) if hasattr(self, 'view_logit') else 0.5
+            fused = w * per_view[:, 0] + (1 - w) * per_view[:, 1:].mean(1)
+        else:
+            fused = per_view[:, 0]
+        pooled0 = pooled.view(B, V, -1)[:, 0]
+        attention_map = torch.ones_like(fmap.view(B, V, *fmap.shape[1:])[:, 0, :1])
+        return fused, per_view, pooled0, attention_map, F.normalize(pooled0.float(), dim=-1)
 
     def plain_logits(self, x, ds=None):
         """The plain classifier itself: logits, the pooled feature they are

@@ -29,9 +29,9 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 MULTI = 'DATASETS' in os.environ
 DS_NAMES, DS_MASKS = None, None
 
-# GPU settings
-assert torch.cuda.is_available()
-device = torch.device("cuda")
+# GPU settings (DEVICE=cpu: end-to-end smoke tests without a GPU)
+device = torch.device(os.environ.get('DEVICE', 'cuda'))
+assert device.type != 'cuda' or torch.cuda.is_available()
 torch.backends.cudnn.benchmark = True
 
 DATA_DIR = config.DATA_DIR
@@ -110,12 +110,17 @@ def evaluate(data_loader, net, class_names):
             X = X.to(device)
             y = y.to(device)
             d = None if d is None else d.to(device)
-            X_m = torch.flip(X, [3])
+            X_m = torch.flip(X, [3]) if USE_TTA else None
 
             # model returns (p, p_effect, feature_matrix, attention_map, h)
-            y_pred_raw, _, _, attention_map, _ = net(X) if d is None else net(X, d)
+            y_pred_raw, y_aux, _, attention_map, _ = net(X) if d is None else net(X, d)
             y_pred_raw = mask_logits(y_pred_raw.float(), d, DS_MASKS)
             outputs = {'center_crop': y_pred_raw}
+            if y_aux.dim() == 3:  # multi-view model (VIEWS=detail|zoom): 'center_crop' is the fused prediction
+                y_aux = mask_logits(y_aux.float(), d, DS_MASKS)
+                outputs['global_view'] = y_aux[:, 0]
+                if y_aux.size(1) > 1:
+                    outputs['detail_views'] = y_aux[:, 1:].mean(1)
             if USE_TWO_VIEW:
                 y_pred_crop = net(batch_augment(X, attention_map, mode='crop', theta=0.5, padding_ratio=0.1))[0]
                 outputs['two_view'] = (y_pred_raw + y_pred_crop) / 2.
@@ -129,8 +134,8 @@ def evaluate(data_loader, net, class_names):
                 outputs['tta'] = (torch.stack(views).mean(0) + torch.stack(views_m).mean(0)) / 2.
 
             for name, y_pred in outputs.items():
-                top5[name](y_pred, y)
-                preds[name].extend(y_pred.argmax(1).cpu().numpy())
+                top5.setdefault(name, TopKAccuracyMetric(topk=(1, 5)))(y_pred, y)
+                preds.setdefault(name, []).extend(y_pred.argmax(1).cpu().numpy())
             all_labels.extend(y.cpu().numpy())
             if d is not None:
                 all_ds.extend(d.cpu().numpy())
