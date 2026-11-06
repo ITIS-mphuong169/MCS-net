@@ -49,29 +49,6 @@ bash server/eval.sh mla64 0
 
 ---
 
-# CLIP ViT-B/16: hướng "toàn cảnh + chi tiết độ phân giải cao" (100 epoch)
+# CLIP ViT (toàn cảnh + chi tiết): xem [SERVER_CLIP.md](SERVER_CLIP.md)
 
-Cần thêm gói: `bash server/setup.sh` (đã thêm `timm transformers`) hoặc `~/mcs-venv/bin/pip install timm transformers`.
-Cần có `git pull` để lấy các file `server/*clip*.sh`, `server/probe.sh`.
-
-```bash
-cd ~/MCS-Net && git pull
-
-# 1. Phép thử (~25 phút GPU). Cuối log có 2 dòng VERDICT.
-bash server/probe.sh 0
-#    VERDICT (a) GO, magnification x2 (hoặc x3)  -> làm tiếp bước 2.   NO-GO -> dừng, báo lại.
-
-# 2. Chạy thử ~10 phút (phải in "CHAY THU OK"), rồi chạy thật: single (mốc so sánh) rồi detail, mỗi cái 100 epoch.
-bash server/run_clip.sh smoke 0
-bash server/run_clip_all.sh 0            # nếu VERDICT nói x3:  MAG=3 bash server/run_clip_all.sh 0
-
-# 3. Đánh giá test (lúc nào cũng được, kể cả khi đang train). Mỗi lần chấm cả epoch cuối và epoch val tốt nhất.
-bash server/eval_clip.sh single 0
-bash server/eval_clip.sh detail 0        # nếu dùng MAG=3 lúc train thì thêm MAG=3 ở đây
-~/mcs-venv/bin/python mcnemar.py ~/results/clip_single_last_ep100/predictions.npz ~/results/clip_detail_last_ep100/predictions.npz
-```
-
-- **Theo dõi**: `tmux attach -t clip_all`, `tail -f ~/runs/srv_clip_detail.log`, W&B run kết thúc bằng `-abl-srv_clip_single` và `-abl-srv_clip_detail`.
-- **Hết bộ nhớ**: `BATCH_SIZE=8 GRAD_ACCUM=4 bash server/run_clip.sh smoke 0`, rồi dùng đúng biến đó cho `run_clip_all.sh`.
-- **Bị dừng giữa chừng**: chạy lại đúng lệnh bước 2, tự train tiếp từ epoch cuối.
-- **Đối chứng thêm (tùy chọn, ~cùng thời gian với detail)**: `bash server/run_clip.sh zoom 0` rồi `bash server/eval_clip.sh zoom 0`. Nó dùng cùng số view nhưng mảnh cắt từ ảnh 224 phóng to, nên chênh giữa detail và zoom là phần do điểm ảnh thật.
+Chạy bằng một file Python (`python server/clip.py ...`), dùng được trên Windows, Linux và macOS, không cần bash.

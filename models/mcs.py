@@ -438,6 +438,8 @@ class WSDAN_MCS(nn.Module):
             if float(os.environ.get('DROP_PATH', 0)) > 0:  # stochastic depth, for long fine-tuning runs
                 kw['drop_path_rate'] = float(os.environ['DROP_PATH'])
             backbone = timm.create_model(net, pretrained=pretrained, **kw)
+            if os.environ.get('GRAD_CKPT', '0') != '0':  # recompute activations in the backward pass: ~30% slower, much less memory
+                backbone.set_grad_checkpointing(True)
             self.features = ViTFeatures(backbone, keep_proj=self.text_init)
             self.num_features = self.features.num_features
             print('==> using timm ViT backbone: %s, num_features=%d' % (net, self.num_features))
