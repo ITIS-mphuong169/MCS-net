@@ -66,7 +66,7 @@ powercfg /change standby-timeout-ac 0
 python server\clip.py train smoke --data D:\wikiart
 ```
 Phải kết thúc bằng `>> CHAY THU OK`. Lần đầu nó tải trọng số CLIP nên cần internet.
-Hết bộ nhớ GPU thì thêm `--batch-size 8 --grad-accum 4`, rồi dùng đúng hai tham số đó ở bước 3.
+Hết bộ nhớ GPU thì giảm batch nhỏ: run `detail` đã mặc định `--batch-size 8 --grad-accum 4` trên card 12 GB; nếu vẫn hết thì `--batch-size 4 --grad-accum 8`. Tích hai số luôn là 32. Dùng đúng hai tham số đó ở bước 3.
 Máy treo hoặc hết RAM (mỗi tiến trình đọc ảnh trên Windows tốn khoảng 1 GB RAM) thì thêm `--workers 4`.
 
 ## 3. Chạy thật: hai run, một lệnh

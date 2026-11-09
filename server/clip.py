@@ -109,14 +109,22 @@ def views_env(mode, args):
 
 
 def batch_plan(args, mode, info):
-    """Effective batch is always 32 images (views multiply the work per step)."""
+    """Effective batch is always 32 images. The detail / zoom runs push 3 views per image through the network,
+    so their micro-batch is smaller: 16 images x 3 views ran out of memory on a 12 GB card (32 single views fit)."""
     if args.batch_size or args.grad_accum:
-        return args.batch_size or 16, args.grad_accum or 2
+        if args.batch_size and args.grad_accum:
+            return args.batch_size, args.grad_accum
+        if args.batch_size:
+            return args.batch_size, max(1, -(-32 // args.batch_size))
+        return max(1, 32 // args.grad_accum), args.grad_accum
     mem = info['mem'] if info else 12
     if args.arch == 'l14':
         return (8, 4) if mode == 'single' else (4, 8)
-    limit = 12 if mode == 'single' else 24
-    return (32, 1) if mem >= limit else (16, 2)
+    if mode == 'single':
+        return (32, 1) if mem >= 12 else (16, 2)
+    if mem >= 40:
+        return 32, 1
+    return (16, 2) if mem >= 24 else (8, 4)
 
 
 KEYS_SHOWN = {'CUDA_VISIBLE_DEVICES', 'DATA_DIR', 'SAVE_ROOT', 'BATCH_SIZE', 'GRAD_ACCUM', 'WORKERS', 'EPOCHS', 'SEED', 'NET',
