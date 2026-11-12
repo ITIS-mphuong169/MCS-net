@@ -106,7 +106,7 @@ def evaluate(data_loader, net, class_names):
     net.eval()
     with torch.no_grad():
         for batch in tqdm(data_loader, unit=' batches'):
-            X, y, d = unpack(batch)
+            X, y, d, _ = unpack(batch)
             X = X.to(device)
             y = y.to(device)
             d = None if d is None else d.to(device)

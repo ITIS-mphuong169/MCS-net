@@ -10,8 +10,11 @@ Cach nhanh nhat tren Windows: bam dup  server\\chay_clip.bat  (no goi lan luot c
     python server/clip.py train smoke                    chay thu ~10 phut, phai in "CHAY THU OK" (chi chay 1 lan)
     python server/clip.py train both                     2 run lien tiep: single roi detail, moi run 100 epoch
     python server/clip.py train single | detail | zoom   chay rieng tung run
+    python server/clip.py train soft                     run single + nhan mem theo hoa si (SOFT_LABELS=artist)
     python server/clip.py eval both                      cham test ca hai (epoch cuoi + epoch val tot nhat) + McNemar,
                                                          ghi bang tom tat vao results/summary_clip.txt
+    python server/clip.py eval single | detail | soft    cham test rieng tung run (+ McNemar voi single neu da cham)
+    python server/clip.py eval wise                      WiSE-FT: tron trong so CLIP goc + run single, khong train (~35 phut)
 
 Tuy chon chung: --data <thu muc WikiArt>  --epochs 100  --mag 2  --arch b16|l14  --gpu 0  --workers N
                 --batch-size N --grad-accum N  --save-root <thu muc luu run>  --dry-run (chi in lenh, khong chay)
@@ -19,6 +22,7 @@ Bi dung giua chung (mat dien, tat may): chay lai DUNG lenh cu (hoac chay lai cha
 
 single : 1 view 224 (moc so sanh).  detail : toan canh 224 + 2 manh chi tiet cat tu anh goc (kiem tra: 9 manh),
 zoom   : doi chung cua detail, manh cat tu chinh anh 224 phong to (khong co diem anh moi).
+soft   : nhu single nhung 10% label smoothing chia theo cac phong cach khac cua cung hoa si (ten file), thay vi chia deu.
 Tat ca dung cung cong thuc: CLIP ViT, head neo chu, attention theo nhan, AdamW, cosine, bfloat16, label smoothing 0.1.
 """
 import argparse
@@ -36,7 +40,7 @@ ENTITY = 'phuongmt-b22cn641-h-c-vi-n-c-ng-ngh-b-u-ch-nh-vi-n-th-ng'
 # arch -> (timm name, run-tag prefix, results prefix)
 ARCHS = {'b16': ('vit_base_patch16_clip_quickgelu_224.openai', 'srv_clip', 'clip'),
          'l14': ('vit_large_patch14_clip_quickgelu_224.openai', 'srv_clipL', 'clipL')}
-MODES = ('single', 'detail', 'zoom')
+MODES = ('single', 'detail', 'zoom', 'soft', 'wise')
 RUN_DIR = 'wikiart_fullpaper_selfattn_abl_{}'   # train.py: save_root / this / (last.ckpt | model.ckpt)
 PACKAGES = ['timm', 'transformers', 'wandb', 'scikit-learn', 'tqdm', 'pillow', 'numpy']
 
@@ -102,6 +106,8 @@ def base_env(args):
 
 
 def views_env(mode, args):
+    if mode == 'soft':  # single view, artist-informed label smoothing (soft_labels.py)
+        return {'VIEWS': 'single', 'SOFT_LABELS': 'artist'}
     if mode == 'single':
         return {'VIEWS': 'single'}
     return {'VIEWS': 'detail' if mode in ('detail', 'smoke') else 'zoom', 'DETAIL_MAG': str(args.mag),
@@ -120,7 +126,7 @@ def batch_plan(args, mode, info):
     mem = info['mem'] if info else 12
     if args.arch == 'l14':
         return (8, 4) if mode == 'single' else (4, 8)
-    if mode == 'single':
+    if mode in ('single', 'soft'):
         return (32, 1) if mem >= 12 else (16, 2)
     if mem >= 40:
         return 32, 1
@@ -131,7 +137,8 @@ KEYS_SHOWN = {'CUDA_VISIBLE_DEVICES', 'DATA_DIR', 'SAVE_ROOT', 'BATCH_SIZE', 'GR
               'PLAIN_CLS', 'TEXT_INIT', 'LABEL_ATTN', 'DATASETS', 'LABEL_SPACE', 'OPTIM', 'BACKBONE_LR_MULT', 'WEIGHT_DECAY',
               'SCHED', 'WARMUP_EPOCHS', 'AMP', 'AMP_DTYPE', 'LABEL_SMOOTH', 'DROP_PATH', 'ABLATION_TAG', 'VIEWS', 'DETAIL_MAG',
               'DETAIL_K', 'DETAIL_K_EVAL', 'DETAIL_K_TEST', 'TRAIN_FRACTION', 'WANDB_MODE', 'INFER_CKPT', 'INFER_OUT',
-              'INFER_TTA', 'PROBE_OUT', 'PROBE_MAGS', 'PROBE_TRAIN_LIMIT', 'PROBE_BS'}
+              'INFER_TTA', 'PROBE_OUT', 'PROBE_MAGS', 'PROBE_TRAIN_LIMIT', 'PROBE_BS', 'SOFT_LABELS', 'WISE_OUT', 'WISE_ALPHAS',
+              'WISE_TEST'}
 
 
 def run_cmd(cmd, env, args, label):
@@ -264,8 +271,9 @@ def cmd_train(args):
             continue
         env, bs, acc = train_env(args, mode, data, info)
         say('')
-        say('=== {} | {} | GPU {} ({} GB) | batch {} x tich luy {} = {} anh | {} epoch | mag x{} | du lieu {}'.format(
-            mode, args.arch, args.gpu, info['mem'] if info else '?', bs, acc, bs * acc, env['EPOCHS'], args.mag, data))
+        say('=== {} | {} | GPU {} ({} GB) | batch {} x tich luy {} = {} anh | {} epoch | {} | du lieu {}'.format(
+            mode, args.arch, args.gpu, info['mem'] if info else '?', bs, acc, bs * acc, env['EPOCHS'],
+            'nhan mem theo hoa si' if mode == 'soft' else 'mag x{}'.format(args.mag), data))
         rc = run_cmd([sys.executable, str(REPO / 'train.py')], env, args, 'train.py ({})'.format(mode))
         if rc != 0:
             sys.exit('!! train.py loi (ma {}). Doc dong loi o tren; chay lai dung lenh cu se tiep tuc tu epoch cuoi.'.format(rc))
@@ -308,20 +316,66 @@ def result_rows(out_dir):
 
 def summary_text(done, extra=''):
     lines = ['{:8s} {:5s} {:>5s}  {:13s} {:>7s} {:>7s} {:>7s}'.format('run', 'ckpt', 'epoch', 'view', 'Acc', 'F1', 'top5')]
-    for (mode, which), out in done.items():
+    for (mode, which), out in sorted(done.items(), key=lambda kv: (MODES.index(kv[0][0]) if kv[0][0] in MODES else 9, kv[0][1])):
         rows, epoch = result_rows(out)
         for view, m in rows.items():
             lines.append('{:8s} {:5s} {:>5s}  {:13s} {:7.2f} {:7.2f} {:7.2f}'.format(
                 mode, which, str(epoch), view, 100 * m['accuracy'], 100 * m['f1_macro'], 100 * m.get('top5_accuracy', 0)))
-    lines.append('(center_crop = du doan da gop; global_view = chi nhin toan canh; detail_views = chi nhin 9 manh)')
+    lines.append('(center_crop = du doan da gop; global_view = chi nhin toan canh; detail_views = chi nhin 9 manh;'
+                 ' wise = tron trong so, alpha chon tren val)')
     return '\n'.join(lines) + ('\n\n' + extra if extra else '')
+
+
+def scored_runs(args, outp):
+    """Every results folder already scored: {(mode, 'last'|'best'): folder}. Folder names are
+    <outp>_<mode>_<which>_ep<N> (infer.py) and <outp>_wise (wise.py)."""
+    done = {}
+    for path in sorted(results_root(args).glob(outp + '_*')):
+        if not (path / 'test_results.json').is_file():
+            continue
+        parts = path.name[len(outp) + 1:].split('_')
+        if parts == ['wise']:
+            done[('wise', 'last')] = path
+        elif len(parts) == 3 and parts[1] in ('last', 'best'):
+            done[(parts[0], parts[1])] = path
+    return done
+
+
+def recipe_env(args, data, netname):
+    env = base_env(args)
+    env.update(DATA_DIR=str(data), BATCH_SIZE=str(args.eval_batch), INFER_TTA='0', NET=netname, PLAIN_CLS='1',
+               TEXT_INIT='1', LABEL_ATTN=str(args.label_attn), DATASETS='wikiart', LABEL_SPACE='union',
+               WORKERS=str(args.workers), VIEWS='single')
+    return env
+
+
+def cmd_wise(args, data, netname, tagp, outp):
+    """WiSE-FT (wise.py) on the single run's last checkpoint: no training, ~11 x 2 passes over val / test."""
+    src = save_root(args) / RUN_DIR.format('{}_single'.format(tagp)) / 'last.ckpt'
+    if not src.is_file():
+        say('!! Khong thay {} (can run single da xong)'.format(src))
+        return
+    out = results_root(args) / '{}_wise'.format(outp)
+    env = recipe_env(args, data, netname)
+    env.update(INFER_CKPT=str(src), WISE_OUT=str(out), WISE_TEST='all')
+    say('')
+    say('=== WiSE-FT: tron trong so CLIP goc va trong so da tinh chinh (run single), chon alpha tren val')
+    rc = run_cmd([sys.executable, str(REPO / 'wise.py')], env, args, 'wise.py (khoang 35 phut)')
+    if rc != 0:
+        say('!! wise.py loi (ma {})'.format(rc))
+
+
+PAIRS = {'detail': 'detail (da gop toan canh + 9 manh)', 'zoom': 'zoom (doi chung)', 'soft': 'soft (nhan mem theo hoa si)',
+         'wise': 'WiSE-FT (alpha chon tren val)'}
 
 
 def cmd_eval(args):
     data = resolve_data(args)
     netname, tagp, outp = ARCHS[args.arch]
     modes = ['single', 'detail'] if args.mode == 'both' else [args.mode]
-    done = {}
+    if 'wise' in modes:
+        cmd_wise(args, data, netname, tagp, outp)
+        modes.remove('wise')
     for mode in modes:
         run_dir = save_root(args) / RUN_DIR.format('{}_{}'.format(tagp, mode))
         for which, fname in (('last', 'last.ckpt'), ('best', 'model.ckpt')):
@@ -338,32 +392,31 @@ def cmd_eval(args):
             out = results_root(args) / '{}_{}_{}_ep{}'.format(outp, mode, which, ep)
             if not args.dry_run:
                 shutil.copy(str(src), str(copy))
-            env = base_env(args)
-            env.update(DATA_DIR=str(data), BATCH_SIZE=str(args.eval_batch), INFER_TTA='0', NET=netname, PLAIN_CLS='1',
-                       TEXT_INIT='1', LABEL_ATTN=str(args.label_attn), DATASETS='wikiart', LABEL_SPACE='union',
-                       WORKERS=str(args.workers), INFER_CKPT=str(copy), INFER_OUT=str(out))
-            if mode == 'single':
-                env.update(VIEWS='single')
-            else:
+            env = recipe_env(args, data, netname)
+            env.update(INFER_CKPT=str(copy), INFER_OUT=str(out))
+            if mode in ('detail', 'zoom'):
                 env.update(VIEWS='detail' if mode == 'detail' else 'zoom', DETAIL_MAG=str(args.mag), DETAIL_K_TEST='9')
             say('')
             say('=== cham test: {} / {} (epoch {})'.format(mode, which, ep))
             rc = run_cmd([sys.executable, str(REPO / 'infer.py')], env, args, 'infer.py ({} {})'.format(mode, which))
-            if rc == 0:
-                done[(mode, which)] = out
+            if rc != 0:
+                say('!! infer.py loi (ma {})'.format(rc))
+    if args.dry_run:
+        return
+    # McNemar of every scored run against single (epoch cuoi), then one summary of everything scored so far
+    done = scored_runs(args, outp)
     extra = ''
-    if ('single', 'last') in done and ('detail', 'last') in done:
-        say('')
-        say('=== McNemar: detail (da gop toan canh + 9 manh) so voi single, epoch cuoi')
-        cmd = [sys.executable, str(REPO / 'mcnemar.py'), str(done[('single', 'last')] / 'predictions.npz'),
-               str(done[('detail', 'last')] / 'predictions.npz')]
-        if args.dry_run:
-            run_cmd(cmd, base_env(args), args, 'mcnemar.py')
-        else:
+    for other, label in PAIRS.items():
+        if ('single', 'last') in done and (other, 'last') in done:
+            say('')
+            say('=== McNemar: {} so voi single, epoch cuoi'.format(label))
+            cmd = [sys.executable, str(REPO / 'mcnemar.py'), str(done[('single', 'last')] / 'predictions.npz'),
+                   str(done[(other, 'last')] / 'predictions.npz')]
             p = subprocess.run(cmd, cwd=str(REPO), env=base_env(args), capture_output=True, text=True)
-            extra = 'McNemar, detail (da gop) so voi single, epoch cuoi:\n' + p.stdout + p.stderr
-            say(extra)
-    if done and not args.dry_run:
+            block = 'McNemar, {} so voi single, epoch cuoi:\n'.format(label) + p.stdout + p.stderr
+            say(block)
+            extra += block + '\n'
+    if done:
         text = summary_text(done, extra)
         results_root(args).mkdir(parents=True, exist_ok=True)
         path = results_root(args) / 'summary_{}.txt'.format(outp)
@@ -378,8 +431,8 @@ def cmd_eval(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('command', choices=['setup', 'login', 'check', 'probe', 'train', 'eval'])
-    ap.add_argument('mode', nargs='?', choices=['smoke', 'single', 'detail', 'zoom', 'both'],
-                    help='train: smoke|single|detail|zoom|both   eval: single|detail|zoom|both')
+    ap.add_argument('mode', nargs='?', choices=['smoke', 'single', 'detail', 'zoom', 'soft', 'both', 'wise'],
+                    help='train: smoke|single|detail|zoom|soft|both   eval: single|detail|zoom|soft|both|wise')
     ap.add_argument('--data', help='thu muc WikiArt (co 27 thu muc phong cach)')
     ap.add_argument('--epochs', type=int, default=100)
     ap.add_argument('--mag', type=int, default=2, help='phong to cua manh chi tiet: 2 hoac 3 (theo VERDICT cua phep thu)')
@@ -396,10 +449,10 @@ def main():
     ap.add_argument('--results', help='noi luu ket qua (mac dinh ~/results)')
     ap.add_argument('--dry-run', action='store_true', help='chi in ra se chay gi, khong chay')
     args = ap.parse_args()
-    if args.command == 'train' and args.mode not in ('smoke', 'single', 'detail', 'zoom', 'both'):
-        ap.error('train can mot MODE: smoke | single | detail | zoom | both')
-    if args.command == 'eval' and args.mode not in ('single', 'detail', 'zoom', 'both'):
-        ap.error('eval can mot MODE: single | detail | zoom | both')
+    if args.command == 'train' and args.mode not in ('smoke', 'single', 'detail', 'zoom', 'soft', 'both'):
+        ap.error('train can mot MODE: smoke | single | detail | zoom | soft | both')
+    if args.command == 'eval' and args.mode not in ('single', 'detail', 'zoom', 'soft', 'both', 'wise'):
+        ap.error('eval can mot MODE: single | detail | zoom | soft | both | wise')
     if args.command in ('train', 'eval', 'probe') and not args.dry_run:
         keep_awake()
     {'setup': cmd_setup, 'login': cmd_login, 'check': cmd_check, 'probe': cmd_probe, 'train': cmd_train,

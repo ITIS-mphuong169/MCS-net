@@ -149,10 +149,13 @@ def seed_split(n, seed=1231, val_split=0.1, test_split=0.1):
 
 class StyleDataset(Dataset):
     """Images of one source dataset. Returns (image, class index in the
-    unified label space, dataset index)."""
+    unified label space, dataset index) and, when the split has soft
+    targets (SOFT_LABELS=artist, training only), that image's (C,) target
+    distribution as a 4th element."""
 
-    def __init__(self, root, items, transform, ds_index):
-        self.root, self.items, self.transform, self.ds_index = root, items, transform, ds_index
+    def __init__(self, root, items, transform, ds_index, targets=None):
+        assert targets is None or len(targets) == len(items)
+        self.root, self.items, self.transform, self.ds_index, self.targets = root, items, transform, ds_index, targets
 
     def __len__(self):
         return len(self.items)
@@ -160,7 +163,9 @@ class StyleDataset(Dataset):
     def __getitem__(self, i):
         rel, label = self.items[i]
         img = safe_pil_loader(os.path.join(self.root, rel))
-        return self.transform(img), label, self.ds_index
+        if self.targets is None:
+            return self.transform(img), label, self.ds_index
+        return self.transform(img), label, self.ds_index, self.targets[i]
 
 
 def dataset_names():
@@ -194,6 +199,11 @@ def get_multi_loaders(batch_size=32, num_workers=4, seed=1231):
     class_to_idx = {c: i for i, c in enumerate(class_names)}
     masks = torch.zeros(len(names), len(class_names), dtype=torch.bool)
 
+    # SOFT_LABELS=artist: per-image target distributions for the training
+    # split (soft_labels.py); the mass moved off the label is LABEL_SMOOTH
+    soft = os.environ.get('SOFT_LABELS', '')
+    assert soft in ('', 'artist', 'text'), 'SOFT_LABELS must be artist or text'
+    soft_stats = {}
     splits = {'train': [], 'val': [], 'test': []}
     per_dataset_sizes = {}
     for di, (name, root, samples) in enumerate(listed):
@@ -203,7 +213,17 @@ def get_multi_loaders(batch_size=32, num_workers=4, seed=1231):
         idx = seed_split(len(items), seed)
         per_dataset_sizes[name] = {k: len(v) for k, v in idx.items()}
         for split in splits:
-            splits[split].append(StyleDataset(root, [items[i] for i in idx[split]], transforms_[split], di))
+            split_items = [items[i] for i in idx[split]]
+            targets = None
+            if soft == 'artist' and split == 'train':
+                from soft_labels import artist_targets, describe
+                targets, soft_stats[name] = artist_targets(name, split_items, len(class_names),
+                                                           float(os.environ.get('LABEL_SMOOTH', 0)),
+                                                           float(os.environ.get('SOFT_PSEUDO', 1.0)))
+                print('{}: {}'.format(name, describe('artist', soft_stats[name], len(class_names))))
+                assert soft_stats[name]['unparsed'] < 0.5 * len(split_items), \
+                    'SOFT_LABELS=artist: most {} file names have no <artist>_<title> form'.format(name)
+            splits[split].append(StyleDataset(root, split_items, transforms_[split], di, targets))
         print('{}: {} images, {} classes, train/val/test {}/{}/{}'.format(
             name, len(items), int(masks[di].sum()), *[len(idx[k]) for k in ('train', 'val', 'test')]))
 
@@ -213,16 +233,16 @@ def get_multi_loaders(batch_size=32, num_workers=4, seed=1231):
                       pin_memory=True, drop_last=(k == 'train'), persistent_workers=num_workers > 0)
         for k, ds in image_datasets.items()}
     dataset_sizes = {k: len(ds) for k, ds in image_datasets.items()}
-    info = {'datasets': names, 'masks': masks, 'label_space': label_space, 'per_dataset_sizes': per_dataset_sizes}
+    info = {'datasets': names, 'masks': masks, 'label_space': label_space, 'per_dataset_sizes': per_dataset_sizes,
+            'soft_stats': soft_stats}
     print('label space: {} ({} classes)'.format(label_space, len(class_names)))
     return dataloaders, dataset_sizes, class_names, info
 
 
 def unpack(batch):
-    """(X, y) or (X, y, d) -> X, y, d (d None for the single-dataset loader)."""
-    if len(batch) == 2:
-        return batch[0], batch[1], None
-    return batch
+    """(X, y), (X, y, d) or (X, y, d, t) -> X, y, d, t: d None for the
+    single-dataset loader, t (soft targets) None unless SOFT_LABELS=artist."""
+    return tuple(batch) + (None,) * (4 - len(batch))
 
 
 def mask_logits(logits, d, masks):

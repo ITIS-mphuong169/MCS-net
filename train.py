@@ -45,6 +45,30 @@ cross_entropy_loss = nn.CrossEntropyLoss()
 # test keep plain CE, so val/loss stays comparable); 0 = off
 LABEL_SMOOTH = float(os.environ.get('LABEL_SMOOTH', 0))
 train_ce = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+# SOFT_LABELS=artist|text (soft_labels.py): same amount of smoothing as
+# LABEL_SMOOTH, but the moved mass follows the label ambiguity (the artist's
+# other styles, or the CLIP text similarity of the style names) instead of
+# being uniform. '' = plain label smoothing. PLAIN_CLS + DATASETS path only.
+SOFT_LABELS = os.environ.get('SOFT_LABELS', '')
+assert SOFT_LABELS in ('', 'artist', 'text'), 'SOFT_LABELS must be artist or text'
+SOFT_TEXT_MATRIX = None  # (C, C) targets by label, SOFT_LABELS=text
+
+
+def soft_targets(y, d, t):
+    """Target distributions of a batch, or None for plain (smoothed) CE."""
+    if SOFT_LABELS == 'text':
+        t = SOFT_TEXT_MATRIX.to(y.device)[y]
+        if d is not None:  # keep the mass inside the sample's own label space
+            t = t * DS_MASKS.to(y.device)[d].float()
+            t = t / t.sum(-1, keepdim=True)
+    return None if t is None else t.to(y.device).float()
+
+
+def train_loss(logits, y, t):
+    if t is None:
+        return train_ce(logits, y)
+    from soft_labels import soft_cross_entropy
+    return soft_cross_entropy(logits, t)
 contrastive_loss = StyleContrastiveLoss(temperature=config.tau)
 
 # loss and metric
@@ -212,6 +236,9 @@ def main():
             "drop_path": float(os.environ.get('DROP_PATH', 0)),
             "label_attn": os.environ.get('LABEL_ATTN', '0') != '0',
             "label_attn_heads": int(os.environ.get('LABEL_ATTN_HEADS', 8)),
+            "soft_labels": SOFT_LABELS or None,
+            "soft_pseudo": float(os.environ.get('SOFT_PSEUDO', 1.0)) if SOFT_LABELS == 'artist' else None,
+            "soft_temp": float(os.environ.get('SOFT_TEMP', 0.05)) if SOFT_LABELS == 'text' else None,
         },
     )
 
@@ -229,10 +256,22 @@ def main():
         dataloaders, dataset_sizes, class_names, info = get_multi_loaders(batch_size=config.batch_size,
                                                                           num_workers=config.workers)
         DS_NAMES, DS_MASKS = info['datasets'], info['masks']
+        if info.get('soft_stats'):
+            wandb.config.update({'soft_stats': info['soft_stats']}, allow_val_change=True)
     else:
+        assert not SOFT_LABELS, 'SOFT_LABELS needs the DATASETS loader (DATASETS=wikiart)'
         dataloaders, dataset_sizes, class_names = get_data_loaders(config.DATA_DIR,
                                                                    batch_size=config.batch_size,
                                                                    num_workers=config.workers)
+    if SOFT_LABELS == 'text':
+        from models.text_head import text_prototypes
+        from soft_labels import text_targets
+        global SOFT_TEXT_MATRIX
+        SOFT_TEXT_MATRIX = text_targets(text_prototypes(class_names, config.net), LABEL_SMOOTH,
+                                        float(os.environ.get('SOFT_TEMP', 0.05)))
+        top = SOFT_TEXT_MATRIX.clone().fill_diagonal_(0).argmax(1)
+        print('SOFT_LABELS=text: nearest style by name, e.g. ' + ', '.join(
+            '{} -> {}'.format(class_names[i], class_names[int(top[i])]) for i in range(min(4, len(class_names)))))
     train_loader = dataloaders['train']
     validate_loader = dataloaders['val']
     if TRAIN_FRACTION < 1.0:
@@ -464,7 +503,7 @@ def zero_shot_check(net, data_loader, batches=32):
     for i, batch in enumerate(data_loader):
         if i >= batches:
             break
-        X, y, d = unpack(batch)
+        X, y, d, _ = unpack(batch)
         with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
             p = (net(X.to(device)) if d is None else net(X.to(device), d.to(device)))[0]
         p = mask_logits(p.float(), None if d is None else d.to(p.device), DS_MASKS)
@@ -514,10 +553,11 @@ def train(**kwargs):
             optimizer.zero_grad()
 
         # obtain data for training
-        X, y, d = unpack(batch)
+        X, y, d, t = unpack(batch)
         X = X.to(device)
         y = y.to(device)
         d = None if d is None else d.to(device)
+        t = soft_targets(y, d, t)  # None unless SOFT_LABELS
 
         # raw image
         with torch.autocast('cuda', dtype=AMP_DTYPE, enabled=AMP):
@@ -532,10 +572,12 @@ def train(**kwargs):
         if PLAIN:
             # plain classifier: CE on the raw image only (the crop/drop/aux
             # metrics below just mirror the raw prediction)
-            batch_loss = train_ce(y_pred_raw, y)
+            batch_loss = train_loss(y_pred_raw, y, t)
             if y_pred_aux.dim() == 3:  # multi-view: also supervise every view on its own
-                batch_loss = batch_loss + VIEW_CE_WEIGHT * train_ce(y_pred_aux.flatten(0, 1),
-                                                                    y.repeat_interleave(y_pred_aux.size(1)))
+                views = y_pred_aux.size(1)
+                batch_loss = batch_loss + VIEW_CE_WEIGHT * train_loss(
+                    y_pred_aux.flatten(0, 1), y.repeat_interleave(views),
+                    None if t is None else t.repeat_interleave(views, dim=0))
             y_pred_aug, y_aug, y_pred_aux, y_aux = y_pred_raw, y, y_pred_raw, y
         else:
             ##################################
@@ -658,7 +700,7 @@ def validate(**kwargs):
     with torch.no_grad():
         for i, batch in enumerate(data_loader):
             # obtain data
-            X, y, d = unpack(batch)
+            X, y, d, _ = unpack(batch)
             X = X.to(device)
             y = y.to(device)
             d = None if d is None else d.to(device)
